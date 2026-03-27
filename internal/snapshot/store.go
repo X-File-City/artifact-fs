@@ -117,6 +117,20 @@ func (s *Store) CurrentGeneration(ctx context.Context) (int64, error) {
 	return gen, err
 }
 
+// ReadState returns persisted HEAD OID, ref, and generation from the snapshot
+// database. Used by status commands that run outside the daemon process.
+func (s *Store) ReadState(ctx context.Context) (headOID, headRef string, generation int64, err error) {
+	gen, err := s.CurrentGeneration(ctx)
+	if err != nil {
+		return "", "", 0, err
+	}
+	row := s.db.QueryRowContext(ctx, `SELECT value FROM repo_state WHERE key='head_oid'`)
+	_ = row.Scan(&headOID)
+	row = s.db.QueryRowContext(ctx, `SELECT value FROM repo_state WHERE key='head_ref'`)
+	_ = row.Scan(&headRef)
+	return headOID, headRef, gen, nil
+}
+
 func (s *Store) GetNode(_ model.RepoID, generation int64, path string) (model.BaseNode, bool) {
 	// Uses background context for backward compat; callers with a deadline
 	// should use GetNodeCtx.

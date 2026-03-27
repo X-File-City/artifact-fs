@@ -49,6 +49,40 @@ git -C /tmp/workers-sdk log --oneline -5
 kill $DAEMON_PID
 ```
 
+## Monitoring hydration and repo status
+
+Check the state of a mounted repo with `status`:
+
+```bash
+./artifact-fs status --name workers-sdk
+# repo=workers-sdk state=mounted head=d4c61587... ref=main ahead=0 behind=0 diverged=false last_fetch=2026-03-27T12:00:00Z result=ok overlay_dirty=false
+```
+
+| Field | Meaning |
+|-------|---------|
+| `state` | `mounted` or `unmounted` |
+| `head` | Current HEAD commit OID |
+| `ref` | Tracked branch |
+| `ahead` / `behind` | Commits ahead/behind the remote tracking branch |
+| `overlay_dirty` | `true` if there are local writes (created, modified, or deleted files) |
+| `last_fetch` / `result` | Timestamp and outcome of the last background fetch |
+
+Hydration (blob downloading) is transparent -- the file tree is visible immediately after mount, and reads block only until the requested blob is fetched. The daemon prioritizes code and manifests (`package.json`, `go.mod`, `README.md`) over binary files.
+
+To monitor hydration activity, watch the daemon's JSON log output:
+
+```bash
+./artifact-fs daemon --root /tmp 2>/tmp/daemon.log &
+# In another terminal:
+tail -f /tmp/daemon.log | grep -i hydrat
+```
+
+Use `--hydration-concurrency` to control the number of parallel blob-fetch workers (default 4). Each worker maintains a persistent `git cat-file --batch` process, so higher values trade memory for faster bulk hydration:
+
+```bash
+./artifact-fs daemon --root /tmp --hydration-concurrency 8
+```
+
 ## Sandboxes and Containers
 
 [`examples/Dockerfile`](examples/Dockerfile) builds artifact-fs and starts a FUSE-mounted repo inside a container. The container requires `--cap-add SYS_ADMIN --device /dev/fuse` for FUSE access.

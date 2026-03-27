@@ -91,20 +91,68 @@ func (s *Service) Close() error {
 }
 
 func (s *Service) Start(ctx context.Context) error {
+	// Initial mount of all registered repos.
+	if err := s.syncRepos(ctx); err != nil {
+		return err
+	}
+
+	// Poll the registry for repos added or removed after startup.
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if err := s.syncRepos(ctx); err != nil {
+				s.logger.Error("registry sync failed", "error", err)
+			}
+		}
+	}
+}
+
+// syncRepos reconciles the running set with the registry. Mounts new repos
+// and unmounts repos that were removed or disabled.
+func (s *Service) syncRepos(ctx context.Context) error {
 	repos, err := s.registry.ListRepos(ctx)
 	if err != nil {
 		return err
 	}
+
+	registered := map[model.RepoID]bool{}
 	for _, repo := range repos {
+		registered[repo.ID] = true
 		if !repo.Enabled {
+			s.unmount(repo.ID)
 			continue
 		}
+		s.mu.Lock()
+		_, running := s.running[repo.ID]
+		s.mu.Unlock()
+		if running {
+			continue
+		}
+		s.logger.Info("mounting repo", "repo", repo.Name)
 		if err := s.mountRepo(ctx, repo); err != nil {
 			s.logger.Error("repo mount failed", "repo", repo.Name, "error", err)
 		}
 	}
-	<-ctx.Done()
-	return ctx.Err()
+
+	// Unmount repos that were removed from the registry.
+	s.mu.Lock()
+	var stale []model.RepoID
+	for id := range s.running {
+		if !registered[id] {
+			stale = append(stale, id)
+		}
+	}
+	s.mu.Unlock()
+	for _, id := range stale {
+		s.logger.Info("unmounting removed repo", "repo", id)
+		s.unmount(id)
+	}
+
+	return nil
 }
 
 func (s *Service) AddRepo(ctx context.Context, cfg model.RepoConfig) error {
@@ -162,15 +210,47 @@ func (s *Service) Status(ctx context.Context, name string) (model.RepoRuntimeSta
 	if err != nil {
 		return model.RepoRuntimeState{}, err
 	}
+
+	// If we're the running daemon, use in-memory state.
 	s.mu.Lock()
 	rt, ok := s.running[cfg.ID]
 	s.mu.Unlock()
-	if !ok {
-		return model.RepoRuntimeState{RepoID: cfg.ID, State: "unmounted"}, nil
+	if ok {
+		dirty, _ := rt.overlay.DirtyCount(ctx)
+		rt.state.DirtyOverlay = dirty > 0
+		return rt.state, nil
 	}
-	dirty, _ := rt.overlay.DirtyCount(ctx)
-	rt.state.DirtyOverlay = dirty > 0
-	return rt.state, nil
+
+	// One-shot CLI process: reconstruct state from persisted stores and
+	// OS-level mount check since we don't share memory with the daemon.
+	st := model.RepoRuntimeState{RepoID: cfg.ID, State: "unmounted"}
+
+	if isMounted(cfg.MountPath) {
+		st.State = "mounted"
+	}
+
+	if cfg.MetaDBPath != "" {
+		if snap, err := snapshot.New(ctx, cfg.MetaDBPath); err == nil {
+			st.CurrentHEADOID, st.CurrentHEADRef, st.SnapshotGeneration, _ = snap.ReadState(ctx)
+			snap.Close()
+		}
+	}
+
+	if cfg.OverlayDBPath != "" {
+		if ov, err := overlay.New(ctx, cfg); err == nil {
+			dirty, _ := ov.DirtyCount(ctx)
+			st.DirtyOverlay = dirty > 0
+			ov.Close()
+		}
+	}
+
+	// Best-effort last fetch time from FETCH_HEAD mtime.
+	if fi, err := os.Stat(filepath.Join(cfg.GitDir, "FETCH_HEAD")); err == nil {
+		st.LastFetchAt = fi.ModTime()
+		st.LastFetchResult = "ok"
+	}
+
+	return st, nil
 }
 
 func (s *Service) FetchNow(ctx context.Context, name string) error {
@@ -225,7 +305,7 @@ func (s *Service) prepareRepo(ctx context.Context, cfg model.RepoConfig) error {
 	if err := s.git.CloneBlobless(ctx, cfg); err != nil {
 		return err
 	}
-	headOID, _, err := s.git.ResolveHEAD(ctx, cfg)
+	headOID, headRef, err := s.git.ResolveHEAD(ctx, cfg)
 	if err != nil {
 		return err
 	}
@@ -238,7 +318,7 @@ func (s *Service) prepareRepo(ctx context.Context, cfg model.RepoConfig) error {
 		return err
 	}
 	defer snap.Close()
-	_, err = snap.PublishGeneration(ctx, cfg.ID, headOID, "", nodes)
+	_, err = snap.PublishGeneration(ctx, cfg.ID, headOID, headRef, nodes)
 	return err
 }
 
