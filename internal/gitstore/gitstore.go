@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/url"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/cloudflare/artifact-fs/internal/auth"
 	"github.com/cloudflare/artifact-fs/internal/model"
@@ -20,13 +22,25 @@ import (
 
 type Store struct {
 	logger *slog.Logger
+	mu     sync.Mutex
+	pools  map[string]*batchPool // gitDir -> pool
 }
 
 func New(logger *slog.Logger) *Store {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Store{logger: logger}
+	return &Store{logger: logger, pools: map[string]*batchPool{}}
+}
+
+// Close shuts down all persistent batch processes.
+func (s *Store) Close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for dir, p := range s.pools {
+		p.closeAll()
+		delete(s.pools, dir)
+	}
 }
 
 func (s *Store) CloneBlobless(ctx context.Context, cfg model.RepoConfig) error {
@@ -147,7 +161,12 @@ func (s *Store) batchResolveSizes(ctx context.Context, repo model.RepoConfig, no
 		return nil
 	}
 	cmd := exec.CommandContext(ctx, "git", "cat-file", "--batch-check", "--buffer")
-	cmd.Env = append(os.Environ(), "GIT_DIR="+repo.GitDir)
+	// GIT_NO_LAZY_FETCH prevents batch-check from fetching blob metadata from
+	// the promisor remote on blobless clones. Without it, every blob OID
+	// triggers a network round-trip, turning a millisecond operation into
+	// minutes. Blobs reported as "missing" keep SizeState="unknown" and get
+	// their size resolved during hydration.
+	cmd.Env = append(os.Environ(), "GIT_DIR="+repo.GitDir, "GIT_NO_LAZY_FETCH=1")
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return err
@@ -187,51 +206,214 @@ func (s *Store) batchResolveSizes(ctx context.Context, repo model.RepoConfig, no
 }
 
 // BlobToCache fetches a git object and writes it to dstPath in a binary-safe manner.
-// It pipes stdout directly to a temp file to avoid string conversion that would
-// corrupt binary content.
+// Uses a persistent cat-file --batch process to amortize process spawn and
+// remote connection costs across multiple blob fetches.
 func (s *Store) BlobToCache(ctx context.Context, repo model.RepoConfig, objectOID string, dstPath string) (size int64, err error) {
 	if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
 		return 0, err
 	}
+	pool := s.getPool(repo.GitDir)
+	batch, err := pool.acquire()
+	if err != nil {
+		return 0, err
+	}
+	size, err = batch.fetchToFile(objectOID, dstPath)
+	if err != nil {
+		// Process may have died or be desynchronized; discard and retry.
+		batch.close()
+		batch, err = pool.acquire()
+		if err != nil {
+			return 0, err
+		}
+		size, err = batch.fetchToFile(objectOID, dstPath)
+		if err != nil {
+			// Retry also failed; close instead of returning a potentially
+			// corrupted process to the pool.
+			batch.close()
+			return 0, err
+		}
+	}
+	pool.release(batch)
+	return size, err
+}
+
+func (s *Store) getPool(gitDir string) *batchPool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if p, ok := s.pools[gitDir]; ok {
+		return p
+	}
+	p := &batchPool{gitDir: gitDir, logger: s.logger, maxSize: 4}
+	s.pools[gitDir] = p
+	return p
+}
+
+// batchPool maintains a pool of reusable cat-file --batch processes so
+// multiple hydrator workers can fetch blobs concurrently.
+type batchPool struct {
+	mu      sync.Mutex
+	free    []*batchCatFile
+	gitDir  string
+	logger  *slog.Logger
+	maxSize int
+}
+
+func (p *batchPool) acquire() (*batchCatFile, error) {
+	p.mu.Lock()
+	if n := len(p.free); n > 0 {
+		b := p.free[n-1]
+		p.free = p.free[:n-1]
+		p.mu.Unlock()
+		if b.alive() {
+			return b, nil
+		}
+		b.close()
+	} else {
+		p.mu.Unlock()
+	}
+	return newBatchCatFile(p.gitDir, p.logger)
+}
+
+func (p *batchPool) release(b *batchCatFile) {
+	if !b.alive() {
+		b.close()
+		return
+	}
+	p.mu.Lock()
+	if len(p.free) < p.maxSize {
+		p.free = append(p.free, b)
+		p.mu.Unlock()
+		return
+	}
+	p.mu.Unlock()
+	b.close()
+}
+
+func (p *batchPool) closeAll() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, b := range p.free {
+		b.close()
+	}
+	p.free = nil
+}
+
+// batchCatFile manages a persistent `git cat-file --batch` process. The
+// persistent process amortizes process startup and (on blobless clones)
+// remote connection costs across multiple blob fetches. Callers must ensure
+// exclusive access (the batchPool handles this).
+type batchCatFile struct {
+	cmd    *exec.Cmd
+	stdin  io.WriteCloser
+	stdout *bufio.Reader
+	logger *slog.Logger
+}
+
+func newBatchCatFile(gitDir string, logger *slog.Logger) (*batchCatFile, error) {
+	cmd := exec.Command("git", "cat-file", "--batch")
+	cmd.Env = append(os.Environ(), "GIT_DIR="+gitDir)
+	cmd.Stderr = os.Stderr
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, fmt.Errorf("batch cat-file stdin pipe: %w", err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("batch cat-file stdout pipe: %w", err)
+	}
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("batch cat-file start: %w", err)
+	}
+	return &batchCatFile{
+		cmd:    cmd,
+		stdin:  stdin,
+		stdout: bufio.NewReaderSize(stdout, 256*1024),
+		logger: logger,
+	}, nil
+}
+
+func (b *batchCatFile) alive() bool {
+	return b.cmd != nil && b.cmd.Process != nil && b.cmd.ProcessState == nil
+}
+
+func (b *batchCatFile) close() {
+	if b.stdin != nil {
+		b.stdin.Close()
+	}
+	if b.cmd != nil && b.cmd.Process != nil {
+		b.cmd.Wait()
+	}
+}
+
+// fetchToFile writes oid to the batch process stdin, reads the response header
+// and streams the blob content directly to dstPath. Binary-safe (no string
+// conversion of blob content).
+func (b *batchCatFile) fetchToFile(oid string, dstPath string) (int64, error) {
+	if b.cmd == nil || b.stdin == nil {
+		return 0, errors.New("batch cat-file process not running")
+	}
+
+	// Request the object
+	if _, err := fmt.Fprintf(b.stdin, "%s\n", oid); err != nil {
+		return 0, fmt.Errorf("batch write: %w", err)
+	}
+
+	// Read response header: "<oid> SP <type> SP <size> LF" or "<oid> SP missing LF"
+	header, err := b.stdout.ReadString('\n')
+	if err != nil {
+		return 0, fmt.Errorf("batch read header: %w", err)
+	}
+	header = strings.TrimRight(header, "\n")
+	fields := strings.Fields(header)
+	if len(fields) < 2 {
+		return 0, fmt.Errorf("unexpected batch header: %q", header)
+	}
+	if fields[1] == "missing" {
+		return 0, fmt.Errorf("object %s missing", oid)
+	}
+	if len(fields) < 3 {
+		return 0, fmt.Errorf("unexpected batch header: %q", header)
+	}
+	size, err := strconv.ParseInt(fields[2], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse size %q: %w", fields[2], err)
+	}
+
+	// Stream blob content to a temp file, then atomic rename.
 	tmp := dstPath + ".tmp"
 	f, err := os.Create(tmp)
 	if err != nil {
+		// Drain the blob content so the protocol stays in sync.
+		io.CopyN(io.Discard, b.stdout, size+1) // +1 for trailing LF
 		return 0, err
 	}
+	written, copyErr := io.CopyN(f, b.stdout, size)
+	// Read the trailing LF that git appends after the content. If this fails
+	// the batch protocol is desynchronized and the caller must discard the
+	// process.
+	if _, lfErr := b.stdout.ReadByte(); lfErr != nil && copyErr == nil {
+		copyErr = fmt.Errorf("batch read trailing LF: %w", lfErr)
+	}
 
-	cmd := exec.CommandContext(ctx, "git", "cat-file", "-p", objectOID)
-	cmd.Env = append(os.Environ(), "GIT_DIR="+repo.GitDir)
-	cmd.Stdout = f
-	errBuf := &bytes.Buffer{}
-	cmd.Stderr = errBuf
+	if syncErr := f.Sync(); syncErr != nil && copyErr == nil {
+		copyErr = syncErr
+	}
+	f.Close()
 
-	runErr := cmd.Run()
-	_ = f.Sync()
-	closeErr := f.Close()
-
-	if runErr != nil {
+	if copyErr != nil || written != size {
 		os.Remove(tmp)
-		msg := auth.RedactString(strings.TrimSpace(errBuf.String()))
-		if msg == "" {
-			msg = auth.RedactString(runErr.Error())
+		if copyErr != nil {
+			return 0, fmt.Errorf("batch read content: %w", copyErr)
 		}
-		return 0, errors.New(msg)
-	}
-	if closeErr != nil {
-		os.Remove(tmp)
-		return 0, closeErr
+		return 0, fmt.Errorf("short read: got %d, want %d", written, size)
 	}
 
-	st, err := os.Stat(tmp)
-	if err != nil {
-		os.Remove(tmp)
-		return 0, err
-	}
 	if err := os.Rename(tmp, dstPath); err != nil {
 		os.Remove(tmp)
 		return 0, err
 	}
-	return st.Size(), nil
+	return size, nil
 }
 
 func (s *Store) ComputeAheadBehind(ctx context.Context, repo model.RepoConfig) (ahead int, behind int, diverged bool, err error) {

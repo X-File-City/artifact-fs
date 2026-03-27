@@ -36,6 +36,7 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 			Usage: "start the artifact-fs daemon",
 			Flags: []ucli.Flag{
 				ucli.StringFlag{Name: "root", Value: filepath.Join(root, "mnt"), Usage: "mount root directory"},
+				ucli.IntFlag{Name: "hydration-concurrency", Value: daemon.DefaultHydrationConcurrency, Usage: "number of concurrent blob hydration workers"},
 			},
 			Action: func(c *ucli.Context) error {
 				logger := logging.NewJSONLogger(stderr, slog.LevelInfo)
@@ -45,6 +46,7 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 				}
 				defer svc.Close()
 				svc.SetMountRoot(c.String("root"))
+				svc.SetHydrationConcurrency(c.Int("hydration-concurrency"))
 				err = svc.Start(ctx)
 				if err == context.Canceled {
 					return nil

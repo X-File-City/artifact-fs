@@ -22,14 +22,17 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/watcher"
 )
 
+const DefaultHydrationConcurrency = 4
+
 type Service struct {
-	root      string
-	mountRoot string
-	logger    *slog.Logger
-	registry  *registry.Store
-	git       *gitstore.Store
-	mu        sync.Mutex
-	running   map[model.RepoID]*repoRuntime
+	root                 string
+	mountRoot            string
+	hydrationConcurrency int
+	logger               *slog.Logger
+	registry             *registry.Store
+	git                  *gitstore.Store
+	mu                   sync.Mutex
+	running              map[model.RepoID]*repoRuntime
 }
 
 type repoRuntime struct {
@@ -63,6 +66,19 @@ func (s *Service) SetMountRoot(root string) {
 	}
 }
 
+func (s *Service) SetHydrationConcurrency(n int) {
+	if n > 0 {
+		s.hydrationConcurrency = n
+	}
+}
+
+func (s *Service) hydrationWorkers() int {
+	if s.hydrationConcurrency > 0 {
+		return s.hydrationConcurrency
+	}
+	return DefaultHydrationConcurrency
+}
+
 func (s *Service) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -70,6 +86,7 @@ func (s *Service) Close() error {
 		s.stopRuntime(rt)
 		delete(s.running, id)
 	}
+	s.git.Close()
 	return s.registry.Close()
 }
 
@@ -259,7 +276,6 @@ func (s *Service) mountRepo(ctx context.Context, cfg model.RepoConfig) error {
 		return err
 	}
 	h := hydrator.New(s.git)
-	h.Start(2, cfg)
 
 	resolver := &fusefs.Resolver{
 		RepoID:   cfg.ID,
@@ -267,6 +283,11 @@ func (s *Service) mountRepo(ctx context.Context, cfg model.RepoConfig) error {
 		Overlay:  ov,
 	}
 	resolver.SetGeneration(gen)
+
+	h.SetOnHydrated(func(_ model.RepoID, objectOID string, size int64) {
+		snap.UpdateSize(resolver.Generation(), objectOID, size)
+	})
+	h.Start(s.hydrationWorkers(), cfg)
 	engine := &fusefs.Engine{
 		Resolver: resolver,
 		Repo:     cfg,

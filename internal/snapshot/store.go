@@ -152,6 +152,13 @@ func (s *Store) ListChildren(_ model.RepoID, generation int64, parentPath string
 	return out, rows.Err()
 }
 
+// UpdateSize sets the size for a blob after hydration. Updates all rows with
+// the given OID in the current generation so stat() returns the correct size
+// without waiting for a full re-index.
+func (s *Store) UpdateSize(generation int64, objectOID string, size int64) {
+	s.db.Exec(`UPDATE base_nodes SET size_bytes=?, size_state='known' WHERE generation=? AND object_oid=?`, size, generation, objectOID)
+}
+
 func (s *Store) nextGenerationTx(ctx context.Context, tx *sql.Tx) (int64, error) {
 	row := tx.QueryRowContext(ctx, `SELECT value FROM repo_state WHERE key='current_generation'`)
 	var val string

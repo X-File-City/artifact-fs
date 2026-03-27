@@ -17,14 +17,20 @@ type BlobFetcher interface {
 	BlobToCache(ctx context.Context, repo model.RepoConfig, objectOID string, dstPath string) (size int64, err error)
 }
 
+// OnHydratedFunc is called after a blob is successfully fetched. Allows the
+// caller to update metadata (e.g., backfill file sizes in the snapshot).
+type OnHydratedFunc func(repoID model.RepoID, objectOID string, size int64)
+
 type Service struct {
-	fetcher  BlobFetcher
-	mu       sync.Mutex
-	pq       priorityQueue
-	wait     map[string][]chan result
-	started  bool
-	stopOnce sync.Once
-	stopCh   chan struct{}
+	fetcher    BlobFetcher
+	mu         sync.Mutex
+	pq         priorityQueue
+	wait       map[string][]chan result
+	started    bool
+	stopOnce   sync.Once
+	stopCh     chan struct{}
+	workReady  chan struct{} // signaled when new work is enqueued
+	onHydrated OnHydratedFunc
 }
 
 type result struct {
@@ -34,7 +40,27 @@ type result struct {
 }
 
 func New(fetcher BlobFetcher) *Service {
-	return &Service{fetcher: fetcher, wait: map[string][]chan result{}, stopCh: make(chan struct{})}
+	return &Service{
+		fetcher:   fetcher,
+		wait:      map[string][]chan result{},
+		stopCh:    make(chan struct{}),
+		workReady: make(chan struct{}, 1),
+	}
+}
+
+// SetOnHydrated registers a callback invoked after each successful blob fetch.
+func (s *Service) SetOnHydrated(fn OnHydratedFunc) {
+	s.mu.Lock()
+	s.onHydrated = fn
+	s.mu.Unlock()
+}
+
+// signalWork performs a non-blocking send on workReady to wake a worker.
+func (s *Service) signalWork() {
+	select {
+	case s.workReady <- struct{}{}:
+	default: // already signaled, workers will drain the queue
+	}
 }
 
 func (s *Service) Start(workers int, repo model.RepoConfig) {
@@ -68,8 +94,9 @@ func (s *Service) Stop() {
 
 func (s *Service) Enqueue(task model.HydrationTask) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	heap.Push(&s.pq, &taskItem{task: task})
+	s.mu.Unlock()
+	s.signalWork()
 }
 
 func (s *Service) EnsureHydrated(ctx context.Context, repo model.RepoConfig, path string, oid string) (cachePath string, size int64, err error) {
@@ -82,13 +109,29 @@ func (s *Service) EnsureHydrated(ctx context.Context, repo model.RepoConfig, pat
 
 	s.mu.Lock()
 	s.wait[key] = append(s.wait[key], ch)
-	if len(s.wait[key]) == 1 {
+	first := len(s.wait[key]) == 1
+	if first {
 		heap.Push(&s.pq, &taskItem{task: model.HydrationTask{RepoID: repo.ID, Path: path, ObjectOID: oid, Priority: PriorityExplicitRead, Reason: "explicit read", EnqueuedAt: time.Now()}})
 	}
 	s.mu.Unlock()
+	if first {
+		s.signalWork()
+	}
 
 	select {
 	case <-ctx.Done():
+		// Remove our channel from the wait list so the worker doesn't
+		// send to an abandoned channel that nobody reads.
+		s.mu.Lock()
+		if chans, ok := s.wait[key]; ok {
+			for i, c := range chans {
+				if c == ch {
+					s.wait[key] = append(chans[:i], chans[i+1:]...)
+					break
+				}
+			}
+		}
+		s.mu.Unlock()
 		return "", 0, ctx.Err()
 	case r := <-ch:
 		return r.cachePath, r.size, r.err
@@ -108,23 +151,31 @@ func (s *Service) QueueDepth(repoID model.RepoID) int {
 }
 
 func (s *Service) worker(repo model.RepoConfig) {
-	t := time.NewTicker(20 * time.Millisecond)
-	defer t.Stop()
 	for {
 		select {
 		case <-s.stopCh:
 			return
-		case <-t.C:
-			s.step(repo)
+		case <-s.workReady:
+			// Drain the queue: process all available items before waiting
+			// for the next signal. Re-signal if items remain so other
+			// workers can help.
+			for {
+				if !s.step(repo) {
+					break
+				}
+				s.signalWork()
+			}
 		}
 	}
 }
 
-func (s *Service) step(repo model.RepoConfig) {
+// step pops and processes one item from the queue. Returns true if an item
+// was processed, false if the queue was empty.
+func (s *Service) step(repo model.RepoConfig) bool {
 	s.mu.Lock()
 	if len(s.pq) == 0 {
 		s.mu.Unlock()
-		return
+		return false
 	}
 	item := heap.Pop(&s.pq).(*taskItem)
 	key := string(item.task.RepoID) + ":" + item.task.ObjectOID
@@ -135,7 +186,7 @@ func (s *Service) step(repo model.RepoConfig) {
 	cachePath := filepath.Join(repo.BlobCacheDir, item.task.ObjectOID)
 	if err := os.MkdirAll(filepath.Dir(cachePath), 0o755); err != nil {
 		s.notify(waits, result{err: err})
-		return
+		return true
 	}
 	// Use a timeout context derived from stopCh so stuck blob fetches don't
 	// block a worker forever.
@@ -151,9 +202,16 @@ func (s *Service) step(repo model.RepoConfig) {
 	size, err := s.fetcher.BlobToCache(fetchCtx, repo, item.task.ObjectOID, cachePath)
 	if err != nil {
 		s.notify(waits, result{err: fmt.Errorf("hydrate %s: %w", item.task.Path, err)})
-		return
+		return true
 	}
 	s.notify(waits, result{cachePath: cachePath, size: size, err: nil})
+	s.mu.Lock()
+	fn := s.onHydrated
+	s.mu.Unlock()
+	if fn != nil {
+		fn(item.task.RepoID, item.task.ObjectOID, size)
+	}
+	return true
 }
 
 func (s *Service) notify(chans []chan result, r result) {

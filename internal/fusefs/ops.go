@@ -6,8 +6,10 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"time"
 
+	"github.com/cloudflare/artifact-fs/internal/hydrator"
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
@@ -125,6 +127,31 @@ func (e *Engine) Truncate(ctx context.Context, path string, size int64) error {
 		return os.ErrNotExist
 	}
 	return os.Truncate(ov.BackingPath, size)
+}
+
+// PrefetchDir enqueues file children of a directory for speculative hydration.
+// Called from OpenDir in a goroutine so it doesn't block the FUSE operation.
+func (e *Engine) PrefetchDir(dirPath string, entries []ReaddirEntry) {
+	gen := e.Resolver.Generation()
+	for _, entry := range entries {
+		if entry.Type != "file" {
+			continue
+		}
+		childPath := model.CleanPath(filepath.Join(dirPath, entry.Name))
+		n, ok := e.Resolver.Snapshot.GetNode(e.Repo.ID, gen, childPath)
+		if !ok || n.ObjectOID == "" {
+			continue
+		}
+		pri := hydrator.ClassifyPriority(childPath)
+		e.Hydrator.Enqueue(model.HydrationTask{
+			RepoID:     e.Repo.ID,
+			Path:       childPath,
+			ObjectOID:  n.ObjectOID,
+			Priority:   pri,
+			Reason:     "prefetch",
+			EnqueuedAt: time.Now(),
+		})
+	}
 }
 
 func readFileChunk(path string, off int64, size int) ([]byte, error) {

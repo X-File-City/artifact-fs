@@ -252,6 +252,11 @@ func (fs *ArtifactFuse) OpenDir(ctx context.Context, op *fuseops.OpenDirOp) erro
 	if ref.IsRoot {
 		entries = append([]ReaddirEntry{{Name: ".git", Type: "file"}}, entries...)
 	}
+
+	// Speculative prefetch: enqueue file children for hydration at a lower
+	// priority so they're warmed in the cache before the user opens them.
+	go fs.engine.PrefetchDir(ref.Path, entries)
+
 	dh := &DirHandle{inode: ref, entries: entries}
 	fs.mu.Lock()
 	handle := fs.nextHandleID
