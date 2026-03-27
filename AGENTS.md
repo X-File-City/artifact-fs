@@ -35,6 +35,9 @@ go build -o artifact-fs ./cmd/artifact-fs
 ./artifact-fs daemon --root /tmp --hydration-concurrency 8 &
 DAEMON_PID=$!
 # test against /tmp/myrepo/
+ls /tmp/myrepo/
+cat /tmp/myrepo/README.md
+git -C /tmp/myrepo log --oneline -5
 kill $DAEMON_PID
 ```
 
@@ -42,6 +45,20 @@ kill $DAEMON_PID
 - Daemon logs JSON to stderr. Capture with `2>/tmp/daemon.log`.
 - After killing the daemon, clean stale mounts with `umount /tmp/myrepo`.
 - macFUSE must be installed on macOS (`/Library/Filesystems/macfuse.fs` must exist).
+
+### CLI commands
+
+| Command | Lifecycle | Description |
+|---------|-----------|-------------|
+| `add-repo --name N --remote URL [--branch B] [--refresh 30s] [--mount-root DIR]` | one-shot | Clone + register a repo |
+| `daemon --root DIR [--hydration-concurrency N]` | long-running | Mount all repos, start background workers |
+| `list-repos` | one-shot | List registered repos |
+| `status --name N` | one-shot | Show repo state (HEAD, fetch status, overlay dirty count) |
+| `fetch --name N` | one-shot | Trigger an immediate fetch from remote |
+| `remove-repo --name N` | one-shot | Unregister a repo |
+| `remount --name N` | one-shot | Remount a repo |
+| `unmount --name N` | one-shot | Unmount a repo |
+| `set-refresh --name N --interval 30s` | one-shot | Change the background fetch interval |
 
 ## Architecture
 
