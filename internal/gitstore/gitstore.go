@@ -95,16 +95,19 @@ func (s *Store) ResolveHEAD(ctx context.Context, repo model.RepoConfig) (oid str
 }
 
 func (s *Store) BuildTreeIndex(ctx context.Context, repo model.RepoConfig, headOID string) ([]model.BaseNode, error) {
-	out, err := runGit(ctx, repo.GitDir, "ls-tree", "-r", "-t", headOID)
+	// -z: NUL-delimited output with raw paths (no C-quoting of non-ASCII names).
+	out, err := runGit(ctx, repo.GitDir, "ls-tree", "-r", "-t", "-z", headOID)
 	if err != nil {
 		return nil, err
 	}
-	scan := bufio.NewScanner(strings.NewReader(out))
+	records := strings.Split(out, "\x00")
 	nodes := []model.BaseNode{rootNode(repo.ID)}
 	var blobOIDs []string
 	blobIndex := map[string][]int{} // oid -> indices into nodes
-	for scan.Scan() {
-		line := scan.Text()
+	for _, line := range records {
+		if line == "" {
+			continue
+		}
 		parts := strings.SplitN(line, "\t", 2)
 		if len(parts) != 2 {
 			continue
@@ -143,9 +146,7 @@ func (s *Store) BuildTreeIndex(ctx context.Context, repo model.RepoConfig, headO
 			}
 		}
 	}
-	if err := scan.Err(); err != nil {
-		return nil, err
-	}
+
 	// Batch-resolve sizes using cat-file --batch-check. This reads from local
 	// pack metadata and doesn't trigger network fetches on blobless clones.
 	if err := s.batchResolveSizes(ctx, repo, nodes, blobOIDs, blobIndex); err != nil {
@@ -414,6 +415,26 @@ func (b *batchCatFile) fetchToFile(oid string, dstPath string) (int64, error) {
 		return 0, err
 	}
 	return size, nil
+}
+
+// CommitTimestamp returns the committer timestamp of the given commit OID.
+func (s *Store) CommitTimestamp(ctx context.Context, repo model.RepoConfig, oid string) (int64, error) {
+	out, err := runGit(ctx, repo.GitDir, "show", "-s", "--format=%ct", oid)
+	if err != nil {
+		return 0, err
+	}
+	ts, err := strconv.ParseInt(strings.TrimSpace(out), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse commit timestamp %q: %w", out, err)
+	}
+	return ts, nil
+}
+
+// ReadTreeHEAD updates the git index to match HEAD. Must be called after HEAD
+// changes (branch switch, commit) so git status inside the mount is correct.
+func (s *Store) ReadTreeHEAD(ctx context.Context, repo model.RepoConfig) error {
+	_, err := runGit(ctx, repo.GitDir, "read-tree", "HEAD")
+	return err
 }
 
 func (s *Store) ComputeAheadBehind(ctx context.Context, repo model.RepoConfig) (ahead int, behind int, diverged bool, err error) {

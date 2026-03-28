@@ -54,8 +54,12 @@ func New(ctx context.Context, cfg model.RepoConfig) (*Store, error) {
 
 func (s *Store) Close() error { return s.db.Close() }
 
+// overlayCols is the column list for overlay_entries queries. Keep in sync with
+// the Scan call in queryEntries and the single-row scan in Get.
+const overlayCols = `path, kind, backing_path, mode, size_bytes, mtime_unix_ns, source_oid, target_path`
+
 func (s *Store) Get(path string) (model.OverlayEntry, bool) {
-	row := s.db.QueryRow(`SELECT path, kind, backing_path, mode, size_bytes, mtime_unix_ns, source_oid, target_path FROM overlay_entries WHERE path=?`, model.CleanPath(path))
+	row := s.db.QueryRow(`SELECT `+overlayCols+` FROM overlay_entries WHERE path=?`, model.CleanPath(path))
 	var e model.OverlayEntry
 	if err := row.Scan(&e.Path, &e.Kind, &e.BackingPath, &e.Mode, &e.SizeBytes, &e.MtimeUnixNs, &e.SourceOID, &e.TargetPath); err != nil {
 		return model.OverlayEntry{}, false
@@ -211,10 +215,85 @@ func (s *Store) SetMtime(ctx context.Context, path string, t time.Time) error {
 	return err
 }
 
-func (s *Store) Reconcile(_ context.Context, _ int64) error {
-	// Intentional no-op: overlay entries are kept across generations and cleaned
-	// only by explicit operations (Remove, Rename). A future reconciliation
-	// strategy may prune entries whose base node was deleted upstream.
+// Reconcile prunes overlay entries that are stale relative to the new base
+// snapshot. Called after a generation change (commit, branch switch, fetch).
+//
+// Rules for each overlay entry:
+//   - modify/rename with source_oid matching the new base OID: base unchanged, KEEP
+//   - modify/rename with source_oid != new base OID: base changed, REMOVE
+//   - create where base now has the path: was committed or exists on new branch, REMOVE
+//   - create where base doesn't have the path: user-created, KEEP
+//   - delete (whiteout) where base doesn't have the path: irrelevant, REMOVE
+//   - delete (whiteout) where base has the path: still meaningful, KEEP
+//   - mkdir where base now has a dir at the path: REMOVE
+//   - mkdir where base doesn't have the path: user-created, KEEP
+func (s *Store) Reconcile(ctx context.Context, baseLookup func(path string) (model.BaseNode, bool)) error {
+	if baseLookup == nil {
+		return nil
+	}
+	entries, err := s.queryEntries(ctx, `SELECT `+overlayCols+` FROM overlay_entries ORDER BY path`)
+	if err != nil {
+		return fmt.Errorf("reconcile list: %w", err)
+	}
+	var toRemove []model.OverlayEntry
+	for _, e := range entries {
+		base, baseExists := baseLookup(e.Path)
+		switch {
+		case e.Kind == "delete":
+			if !baseExists {
+				toRemove = append(toRemove, e)
+			}
+		case e.Kind == "create":
+			if baseExists {
+				toRemove = append(toRemove, e)
+			}
+		case e.Kind == "mkdir":
+			if baseExists && base.Type == "dir" {
+				toRemove = append(toRemove, e)
+			}
+		case e.Kind == "modify" || e.Kind == "rename":
+			// Keep only if the base file still exists with the same OID the
+			// overlay was derived from. Otherwise the base changed (commit,
+			// branch switch) or disappeared and the overlay is stale.
+			if !baseExists || e.SourceOID != base.ObjectOID {
+				toRemove = append(toRemove, e)
+			}
+		}
+	}
+	if len(toRemove) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	// Guard the DELETE so a concurrent FUSE write between our read and this
+	// delete is not lost. source_oid protects modify/rename entries (writes
+	// change the OID). mtime_unix_ns protects create/delete entries where
+	// source_oid is always empty -- any concurrent write updates the mtime.
+	stmt, err := tx.PrepareContext(ctx, `DELETE FROM overlay_entries WHERE path=? AND kind=? AND source_oid=? AND mtime_unix_ns=?`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	for _, e := range toRemove {
+		if _, err := stmt.ExecContext(ctx, e.Path, e.Kind, e.SourceOID, e.MtimeUnixNs); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	// Delete backing files only after the transaction commits. If we deleted
+	// before commit and the transaction rolled back, DB rows would reference
+	// non-existent files. Reverse order so children are removed before parents
+	// (os.Remove fails on non-empty directories).
+	for i := len(toRemove) - 1; i >= 0; i-- {
+		if toRemove[i].BackingPath != "" {
+			_ = os.Remove(toRemove[i].BackingPath)
+		}
+	}
 	return nil
 }
 
@@ -231,12 +310,16 @@ func (s *Store) ListByPrefix(ctx context.Context, prefix string) ([]model.Overla
 	prefix = model.CleanPath(prefix)
 	var pattern string
 	if prefix == "." {
-		// Root: match all entries
 		pattern = "%"
 	} else {
 		pattern = prefix + "/%"
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT path, kind, backing_path, mode, size_bytes, mtime_unix_ns, source_oid, target_path FROM overlay_entries WHERE path LIKE ? ORDER BY path`, pattern)
+	return s.queryEntries(ctx, `SELECT `+overlayCols+` FROM overlay_entries WHERE path LIKE ? ORDER BY path`, pattern)
+}
+
+// queryEntries runs an arbitrary overlay query and scans the results.
+func (s *Store) queryEntries(ctx context.Context, query string, args ...any) ([]model.OverlayEntry, error) {
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}

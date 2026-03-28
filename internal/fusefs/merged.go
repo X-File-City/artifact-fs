@@ -42,12 +42,15 @@ type SnapshotLookup interface {
 type Resolver struct {
 	RepoID     model.RepoID
 	generation atomic.Int64
+	commitTime atomic.Int64 // unix seconds of HEAD commit
 	Snapshot   SnapshotLookup
 	Overlay    model.OverlayStore
 }
 
 func (r *Resolver) SetGeneration(gen int64) { r.generation.Store(gen) }
 func (r *Resolver) Generation() int64       { return r.generation.Load() }
+func (r *Resolver) SetCommitTime(ts int64)  { r.commitTime.Store(ts) }
+func (r *Resolver) CommitTime() int64       { return r.commitTime.Load() }
 
 type ResolvedNode struct {
 	FromOverlay bool
@@ -93,9 +96,13 @@ func (r *Resolver) Getattr(path string) (mode uint32, size int64, nodeType strin
 		return n.Overlay.Mode, n.Overlay.SizeBytes, typ, mt, nil
 	}
 	mode = normalizeMode(n.Base.Mode, n.Base.Type)
-	// Base files use a stable epoch mtime per generation to avoid
-	// nondeterministic timestamps that confuse make and git status.
-	mt := time.Unix(r.Generation(), 0)
+	// Base files use the HEAD commit timestamp for mtime so tools like
+	// make see a stable, meaningful value.
+	ct := r.CommitTime()
+	if ct == 0 {
+		ct = r.Generation() // fallback: commit time unavailable
+	}
+	mt := time.Unix(ct, 0)
 	return mode, n.Base.SizeBytes, n.Base.Type, mt, nil
 }
 

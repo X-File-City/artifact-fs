@@ -88,6 +88,87 @@ func TestBlobToCacheBinarySafe(t *testing.T) {
 	}
 }
 
+func TestBuildTreeIndexNonASCIIPaths(t *testing.T) {
+	t.Parallel()
+	tmp := t.TempDir()
+	repo := filepath.Join(tmp, "repo")
+	run(t, "git", "init", repo)
+	// Create files with non-ASCII names that git would C-quote without -z.
+	os.WriteFile(filepath.Join(repo, "café.txt"), []byte("latte"), 0o644)
+	os.WriteFile(filepath.Join(repo, "日本語.md"), []byte("hello"), 0o644)
+	run(t, "git", "-C", repo, "add", ".")
+	run(t, "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "non-ascii files")
+
+	cfg := model.RepoConfig{ID: "x", GitDir: filepath.Join(repo, ".git")}
+	store := New(nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	oid, _, err := store.ResolveHEAD(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodes, err := store.BuildTreeIndex(ctx, cfg, oid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths := map[string]bool{}
+	for _, n := range nodes {
+		paths[n.Path] = true
+	}
+	if !paths["café.txt"] {
+		t.Fatalf("expected café.txt in tree, got paths: %v", paths)
+	}
+	if !paths["日本語.md"] {
+		t.Fatalf("expected 日本語.md in tree, got paths: %v", paths)
+	}
+}
+
+func TestCommitTimestamp(t *testing.T) {
+	t.Parallel()
+	tmp := t.TempDir()
+	repo := filepath.Join(tmp, "repo")
+	run(t, "git", "init", repo)
+	os.WriteFile(filepath.Join(repo, "f.txt"), []byte("x"), 0o644)
+	run(t, "git", "-C", repo, "add", ".")
+	run(t, "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init")
+
+	cfg := model.RepoConfig{ID: "x", GitDir: filepath.Join(repo, ".git")}
+	store := New(nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	oid, _, err := store.ResolveHEAD(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts, err := store.CommitTimestamp(ctx, cfg, oid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Timestamp should be recent (within last minute).
+	now := time.Now().Unix()
+	if ts < now-60 || ts > now+60 {
+		t.Fatalf("timestamp %d not within 60s of now %d", ts, now)
+	}
+}
+
+func TestReadTreeHEAD(t *testing.T) {
+	t.Parallel()
+	tmp := t.TempDir()
+	repo := filepath.Join(tmp, "repo")
+	run(t, "git", "init", repo)
+	os.WriteFile(filepath.Join(repo, "f.txt"), []byte("x"), 0o644)
+	run(t, "git", "-C", repo, "add", ".")
+	run(t, "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init")
+
+	cfg := model.RepoConfig{ID: "x", GitDir: filepath.Join(repo, ".git")}
+	store := New(nil)
+	ctx := context.Background()
+	// Should not error on a clean repo.
+	if err := store.ReadTreeHEAD(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCredentialEnvEscapesSingleQuotes(t *testing.T) {
 	t.Parallel()
 	// Password with a single quote should be escaped

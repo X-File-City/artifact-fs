@@ -14,11 +14,16 @@ Notably:
 
 ## What are Cloudflare Artifacts?
 
-TODO - describe briefly and link to [Cloudflare Artifacts](http://workers.cloudflare.com/product/artifacts)
+[Cloudflare Artifacts](https://workers.cloudflare.com/product/artifacts) is a versioned filesystem that speaks git. Create a repo per user, per agent session, per sandbox... as many as you need. 
+
+It's designed for agent toolchains, sandboxes, and CI/CD systems that need fast, scalable access to code repositories. ArtifactFS is the optional FUSE driver -- it lets you mount an Artifact (or any git repo) as a local filesystem without waiting for a full clone.
 
 ## Build and Install
 
-Requires Go 1.24+ and [macFUSE](https://osxfuse.github.io/) on macOS.
+Requires Go 1.24+ and a FUSE implementation:
+
+- **macOS** -- [macFUSE](https://osxfuse.github.io/)
+- **Linux** -- `fuse3` (`apt install fuse3` on Debian/Ubuntu, `dnf install fuse3` on Fedora)
 
 ```bash
 go build -o artifact-fs ./cmd/artifact-fs
@@ -67,7 +72,7 @@ Check the state of a mounted repo with `status`:
 | `overlay_dirty` | `true` if there are local writes (created, modified, or deleted files) |
 | `last_fetch` / `result` | Timestamp and outcome of the last background fetch |
 
-Hydration (blob downloading) is transparent -- the file tree is visible immediately after mount, and reads block only until the requested blob is fetched. The daemon prioritizes code and manifests (`package.json`, `go.mod`, `README.md`) over binary files.
+Hydration (blob downloading) is transparent: the file tree is visible immediately after mount, and reads block only until the requested blob is fetched. The daemon prioritizes code and manifests (`package.json`, `go.mod`, `README.md`) over binary files.
 
 To monitor hydration activity, watch the daemon's JSON log output:
 
@@ -110,15 +115,76 @@ On hosts with AppArmor enabled (Ubuntu default), add `--security-opt apparmor:un
 
 ## Architecture
 
-This implementation includes:
+ArtifactFS has two distinct phases: a one-shot **setup** (`add-repo`) that performs a fast blobless clone of a repo, and a long-running **daemon** that mounts it via FUSE and serves file operations.
 
-- Registry-backed repo lifecycle (`add-repo`, `remove-repo`, `list-repos`, `status`, `fetch`, `remount`, `unmount`, `set-refresh`)
-- Blobless clone and Git substrate via system `git`
-- Snapshot index persisted in SQLite with generation publishing
-- Persistent writable overlay (`upper` + SQLite metadata + whiteouts)
-- Hydrator queue with per-object deduped waiters and priority classification
-- Merged view resolver and operation engine (`Lookup`, `Getattr`, `Readdir`, read/write path semantics)
-- Token redaction utilities for logs and command output
+```
+                         ┌─────────────────────────────────────────────────┐
+                         │                    Daemon                       │
+                         │                                                 │
+  ┌──────────┐  clone    │  ┌──────────┐    ls-tree     ┌──────────────┐  │
+  │  Remote  │◄──────────┼──│ GitStore │───────────────►│   Snapshot   │  │
+  │   repo   │  fetch    │  │          │  cat-file       │   (SQLite)   │  │
+  └──────────┘           │  │ batch    │  --batch-check  │              │  │
+                         │  │ pool     │                 │  base_nodes  │  │
+                         │  └────┬─────┘                 │  per gen     │  │
+                         │       │ cat-file               └──────┬───────┘  │
+                         │       │ --batch                       │          │
+                         │       ▼                               ▼          │
+                         │  ┌──────────┐                 ┌──────────────┐  │
+                         │  │  Blob    │                 │   Resolver   │  │
+                         │  │  Cache   │                 │              │  │
+                         │  │  (disk)  │◄────hydrate─────│ snap + ovl   │  │
+                         │  └──────────┘                 │  merged view │  │
+                         │       ▲                       └──────┬───────┘  │
+                         │       │                              │          │
+                         │  ┌────┴─────┐   prefetch      ┌─────┴────────┐ │
+                         │  │ Hydrator │◄────────────────│    Engine    │ │
+                         │  │          │                  │              │ │
+                         │  │ priority │   ensureOverlay  │ read / write │ │
+                         │  │ queue    │   copy-on-write  │ create / rm  │ │
+                         │  └──────────┘                  └─────┬────────┘ │
+                         │                                      │          │
+                         │  ┌──────────┐                 ┌──────┴───────┐  │
+                         │  │ Overlay  │◄────────────────│  FUSE Layer  │  │
+                         │  │ (SQLite  │  write ops      │  (macFUSE /  │  │
+                         │  │  + upper │                  │   /dev/fuse) │  │
+                         │  │  dir)    │                  └──────┬───────┘  │
+                         │  └──────────┘                         │          │
+                         │                                       │          │
+                         │  ┌──────────┐  HEAD poll       ┌─────┴────────┐ │
+                         │  │ Watcher  │─────────────────►│ Mount point  │ │
+                         │  │ (500ms)  │  re-index +      │ /tmp/myrepo  │ │
+                         │  └──────────┘  reconcile       └──────────────┘ │
+                         └─────────────────────────────────────────────────┘
+```
+
+### Data flow
+
+1. **Clone** -- `add-repo` runs `git clone --filter=blob:none` (blobless). Only commits, trees, and refs are fetched. No file content is downloaded.
+
+2. **Index** -- `git ls-tree -r -t -z HEAD` enumerates every path in the tree. Sizes are resolved locally via `git cat-file --batch-check` with `GIT_NO_LAZY_FETCH=1` to avoid network round-trips. The result is bulk-inserted into a SQLite `base_nodes` table as a new generation.
+
+3. **Mount** -- The FUSE layer exposes the tree immediately. A synthesized `.git` gitfile points at the real gitdir so git commands work inside the mount.
+
+4. **Read** -- The Resolver merges the snapshot (base tree) with the overlay (local writes). For base files, reads block until the Hydrator fetches the blob via a persistent `git cat-file --batch` process and streams it to the blob cache.
+
+5. **Write** -- The Engine promotes base files to the overlay via copy-on-write (hydrate, then copy to the `upper/` directory). Subsequent reads come from the overlay. Deletes are recorded as whiteouts.
+
+6. **Background** -- A watcher polls HEAD/refs every 500ms. On HEAD changes (commit, branch switch, fetch), the daemon re-indexes the tree, publishes a new snapshot generation, reconciles stale overlay entries, and refreshes the git index.
+
+### Subsystems
+
+| Package | Role |
+|---------|------|
+| `daemon` | Orchestrates repo lifecycle, refresh loop, watcher callbacks |
+| `fusefs` | FUSE adapter (inode management, op dispatch), Resolver (merged view), Engine (read/write logic) |
+| `gitstore` | Git CLI wrapper: clone, fetch, ls-tree, batch pool for `cat-file --batch` |
+| `snapshot` | SQLite store for `base_nodes` keyed by `(generation, path)` |
+| `overlay` | SQLite metadata + `upper/` directory for local writes, whiteouts, reconciliation |
+| `hydrator` | Priority queue with deduped waiters; workers block on a `workReady` channel |
+| `watcher` | Polls gitdir mtimes (HEAD, index, refs) at 500ms intervals |
+| `registry` | SQLite-backed repo config persistence |
+| `model` | Shared types and canonical interfaces (`GitStore`, `SnapshotStore`, `OverlayStore`, `Hydrator`) |
 
 ## Supported git operations
 
@@ -150,20 +216,20 @@ Work in progress. The table below reflects operations tested against [cloudflare
 | `git show` | Supported | |
 | `git remote -v` | Supported | Credentials stripped from output |
 | `git stash list` | Supported | |
-| `git status` | Supported | ~7s on 5800-entry repo; some unicode-named files show as deleted |
+| `git status` | Supported | ~7s on 5800-entry repo |
 | `git diff` | Supported | Shows correct unified diff for modified files |
 | `git add` | Supported | Stages modified files |
 | `git reset` | Supported | ~6.5s index refresh |
+| `git commit` | Supported | Watcher detects HEAD change; overlay reconciles stale entries |
+| `git checkout` | Supported | Re-indexes tree, reconciles overlay, refreshes git index |
 | `git fetch` | Supported | Background refresh loop fetches periodically |
 
 ### Known limitations
 
 | Issue | Impact |
 |-------|--------|
-| Files with non-ASCII names (e.g. `♫`, `ü`) may show as deleted in `git status` | Low -- path encoding mismatch between git index and FUSE tree |
-| `mtime` is always `time.Now()`, not the actual commit timestamp | Cosmetic |
-| `git commit` is untested | Likely works but not yet verified |
-| Branch switching via `git checkout` not yet wired | Watcher detects HEAD changes but overlay reconciliation is a v1 stub |
+| `git status` takes ~7s on large repos (5800+ entries) | Performance -- full tree walk through FUSE |
+| `git reset` takes ~6.5s for index refresh | Performance -- same root cause as `git status` |
 
 ## Testing
 
@@ -173,15 +239,17 @@ Unit tests:
 go test ./...
 ```
 
-End-to-end tests mount a real git repo via macFUSE and exercise filesystem + git operations with a real git client. They require macFUSE to be installed and are off by default.
+End-to-end tests mount a git repo via FUSE and exercise filesystem + git operations (including commit and overlay reconciliation). They require a FUSE implementation (macFUSE on macOS, `fuse3` on Linux) and are off by default.
+
+By default, e2e tests create a local bare repo -- no network required. Set `AFS_E2E_REPO` to test against a real remote.
 
 ```bash
-# Run e2e tests against the default repo (cloudflare/workers-sdk)
+# Run e2e tests (uses a local test repo by default)
 AFS_RUN_E2E_TESTS=1 go test -v -run TestE2E -count=1 -timeout 10m .
 
-# Run against a private repo with authentication
+# Run against a specific remote repo
 AFS_RUN_E2E_TESTS=1 \
-  AFS_E2E_REPO=https://ghp_yourtoken@github.com/org/private-repo.git \
+  AFS_E2E_REPO=https://github.com/cloudflare/workers-sdk.git \
   go test -v -run TestE2E -count=1 -timeout 10m .
 ```
 
@@ -190,12 +258,12 @@ AFS_RUN_E2E_TESTS=1 \
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `AFS_RUN_E2E_TESTS` | `0` | Set to `1` to enable end-to-end tests |
-| `AFS_E2E_REPO` | `https://github.com/cloudflare/workers-sdk.git` | Git HTTPS remote URL for e2e tests. Accepts authenticated URLs to avoid rate limits or test against private repos. |
+| `AFS_E2E_REPO` | local bare repo | Git remote URL for e2e tests. When unset, a local bare repo is created automatically. Set to an HTTPS URL to test against a real remote (accepts authenticated URLs). |
 | `ARTIFACT_FS_ROOT` | `~/.local/share/artifact-fs` (macOS) or `/var/lib/artifact-fs` (Linux) | Runtime data root for the daemon and CLI |
 
 ## Contributing
 
-TODO
+See [AGENTS.md](AGENTS.md) for build commands, architecture details, and conventions. Run `go test ./...` and `go vet ./...` before submitting changes.
 
 ## Credits
 

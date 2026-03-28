@@ -19,10 +19,76 @@ import (
 	"github.com/cloudflare/artifact-fs/internal/model"
 )
 
-const (
-	defaultRepo = "https://github.com/cloudflare/workers-sdk.git"
-	repoName    = "e2e-test"
-)
+const repoName = "e2e-test"
+
+// createLocalTestRepo creates a bare git repo seeded with enough content
+// to exercise all e2e test assertions. Returns a file:// URL suitable for
+// blobless clone (file:// forces the smart transport which supports --filter).
+func createLocalTestRepo(t *testing.T) string {
+	t.Helper()
+
+	bareDir := filepath.Join(t.TempDir(), "test-repo.git")
+	workDir := filepath.Join(t.TempDir(), "work")
+
+	// Initialize bare repo.
+	run(t, "", "git", "init", "--bare", bareDir)
+
+	// Create a working tree and seed content across 3 commits.
+	run(t, "", "git", "clone", bareDir, workDir)
+	run(t, workDir, "git", "config", "user.name", "E2E Setup")
+	run(t, workDir, "git", "config", "user.email", "e2e@test")
+	// Some git versions default to "master"; force "main" for consistency.
+	run(t, workDir, "git", "checkout", "-b", "main")
+
+	// Commit 1: readme and license files.
+	writeTestFile(t, workDir, "README.md", "# Test Repo\n\nA test repository for ArtifactFS e2e tests.\n")
+	writeTestFile(t, workDir, "LICENSE-MIT", "MIT License\n\nCopyright 2024 Test\n\nPermission is hereby granted, free of charge.\n")
+	writeTestFile(t, workDir, "SECURITY.md", "# Security\n\nReport security issues responsibly.\n")
+	run(t, workDir, "git", "add", "-A")
+	run(t, workDir, "git", "commit", "-m", "add readme and license")
+
+	// Commit 2: root package manifest.
+	writeTestFile(t, workDir, "package.json", `{"name":"e2e-test-repo","version":"1.0.0"}`+"\n")
+	run(t, workDir, "git", "add", "-A")
+	run(t, workDir, "git", "commit", "-m", "add package manifests")
+
+	// Commit 3: packages directory with 4 subdirectories.
+	for _, pkg := range []string{"wrangler", "miniflare", "vitest-pool", "workers-shared"} {
+		dir := filepath.Join(workDir, "packages", pkg)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		writeTestFile(t, dir, "package.json", `{"name":"`+pkg+`","version":"0.0.1"}`+"\n")
+	}
+	run(t, workDir, "git", "add", "-A")
+	run(t, workDir, "git", "commit", "-m", "add packages directory")
+
+	run(t, workDir, "git", "push", "origin", "main")
+
+	return "file://" + bareDir
+}
+
+func writeTestFile(t *testing.T, dir, name, content string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func run(t *testing.T, dir string, name string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command(name, args...)
+	if dir != "" {
+		cmd.Dir = dir
+	}
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("%s %s failed: %v\nstderr: %s", name, strings.Join(args, " "), err, stderr.String())
+	}
+	return stdout.String()
+}
 
 func TestE2E(t *testing.T) {
 	if os.Getenv("AFS_RUN_E2E_TESTS") != "1" {
@@ -32,7 +98,8 @@ func TestE2E(t *testing.T) {
 
 	remoteURL := os.Getenv("AFS_E2E_REPO")
 	if remoteURL == "" {
-		remoteURL = defaultRepo
+		remoteURL = createLocalTestRepo(t)
+		t.Logf("using local test repo: %s", remoteURL)
 	}
 
 	root := t.TempDir()
@@ -312,6 +379,67 @@ func TestE2E(t *testing.T) {
 		out := gitCmd(t, mountPath, "status", "--short")
 		if len(out) == 0 {
 			t.Fatal("expected non-empty status output after modifications")
+		}
+	})
+
+	// ---- Git commit + reconciliation ----
+	// Tests the full post-commit flow: watcher detects HEAD change ->
+	// daemon re-indexes tree -> overlay reconciliation cleans up committed
+	// entries -> new snapshot generation is visible to FUSE.
+
+	t.Run("git/commit", func(t *testing.T) {
+		preCommitHEAD := strings.TrimSpace(gitCmd(t, mountPath, "rev-parse", "HEAD"))
+
+		// Create and stage a new file (isolated from prior dirty state).
+		commitFile := filepath.Join(mountPath, "e2e-commit.txt")
+		if err := os.WriteFile(commitFile, []byte("committed content\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		gitCmd(t, mountPath, "add", "e2e-commit.txt")
+
+		// Commit (use -c flags to avoid needing global git config).
+		gitCmd(t, mountPath,
+			"-c", "user.name=E2E Test",
+			"-c", "user.email=e2e@test",
+			"commit", "-m", "e2e commit test",
+		)
+
+		// Poll until reconciliation completes. The watcher polls HEAD at
+		// 500ms; after detecting the change, onHEADChanged re-indexes the
+		// tree, reconciles the overlay, refreshes the git index, and swaps
+		// the snapshot generation. When git status reports the committed
+		// file as clean, all of that has finished.
+		deadline := time.Now().Add(10 * time.Second)
+		reconciled := false
+		for time.Now().Before(deadline) {
+			out := gitCmd(t, mountPath, "status", "--short", "e2e-commit.txt")
+			if strings.TrimSpace(out) == "" {
+				reconciled = true
+				break
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+		if !reconciled {
+			t.Fatal("overlay reconciliation did not complete within timeout")
+		}
+
+		// HEAD should have advanced.
+		postCommitHEAD := strings.TrimSpace(gitCmd(t, mountPath, "rev-parse", "HEAD"))
+		if postCommitHEAD == preCommitHEAD {
+			t.Fatalf("HEAD did not change: still %s", preCommitHEAD)
+		}
+
+		// Log should contain our commit message.
+		logOut := gitCmd(t, mountPath, "log", "--oneline", "-1")
+		if !strings.Contains(logOut, "e2e commit test") {
+			t.Fatalf("expected commit message in log, got %q", logOut)
+		}
+
+		// File content should still be readable (now served from the base
+		// snapshot after overlay reconciliation removed the entry).
+		got := readFileStr(t, commitFile)
+		if got != "committed content\n" {
+			t.Fatalf("expected 'committed content\\n', got %q", got)
 		}
 	})
 

@@ -402,6 +402,11 @@ func (s *Service) mountRepo(ctx context.Context, cfg model.RepoConfig) error {
 		Overlay:  ov,
 	}
 	resolver.SetGeneration(gen)
+	if ts, err := s.git.CommitTimestamp(ctx, cfg, headOID); err == nil {
+		resolver.SetCommitTime(ts)
+	} else {
+		s.logger.Warn("commit timestamp unavailable, mtime will use generation fallback", "repo", cfg.Name, "error", err)
+	}
 
 	h.SetOnHydrated(func(_ model.RepoID, objectOID string, size int64) {
 		snap.UpdateSize(resolver.Generation(), objectOID, size)
@@ -464,7 +469,10 @@ func (s *Service) onHEADChanged(ctx context.Context, rt *repoRuntime) {
 		s.logger.Error("HEAD resolve failed", "repo", rt.cfg.Name, "error", err)
 		return
 	}
-	if oid == rt.state.CurrentHEADOID {
+	s.mu.Lock()
+	prevOID := rt.state.CurrentHEADOID
+	s.mu.Unlock()
+	if oid == prevOID {
 		return
 	}
 	nodes, err := s.git.BuildTreeIndex(ctx, rt.cfg, oid)
@@ -477,7 +485,26 @@ func (s *Service) onHEADChanged(ctx context.Context, rt *repoRuntime) {
 		s.logger.Error("snapshot publish failed", "repo", rt.cfg.Name, "error", err)
 		return
 	}
-	_ = rt.overlay.Reconcile(ctx, gen)
+	baseLookup := func(path string) (model.BaseNode, bool) {
+		return rt.snapshot.GetNode(rt.cfg.ID, gen, path)
+	}
+	if err := rt.overlay.Reconcile(ctx, baseLookup); err != nil {
+		s.logger.Warn("overlay reconcile failed", "repo", rt.cfg.Name, "error", err)
+	}
+
+	// Refresh the git index so `git status` inside the mount reflects the
+	// new HEAD. Without this, the index still describes the old tree and
+	// status shows phantom diffs after a branch switch or commit.
+	if err := s.git.ReadTreeHEAD(ctx, rt.cfg); err != nil {
+		s.logger.Warn("read-tree HEAD failed", "repo", rt.cfg.Name, "error", err)
+	}
+
+	if ts, err := s.git.CommitTimestamp(ctx, rt.cfg, oid); err == nil {
+		rt.resolver.SetCommitTime(ts)
+	} else {
+		s.logger.Warn("commit timestamp unavailable", "repo", rt.cfg.Name, "error", err)
+	}
+
 	// Atomically update the resolver's generation so FUSE ops see the new snapshot
 	rt.resolver.SetGeneration(gen)
 	s.mu.Lock()

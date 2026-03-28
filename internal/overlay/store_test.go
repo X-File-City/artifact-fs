@@ -182,6 +182,108 @@ func TestListByPrefix(t *testing.T) {
 	}
 }
 
+func TestReconcileAfterCommit(t *testing.T) {
+	s, cfg := testStore(t)
+	ctx := context.Background()
+
+	// Simulate: user modified foo.txt (source_oid="aaa") then committed.
+	// After commit, the base has foo.txt with a new OID ("bbb").
+	base := model.BaseNode{RepoID: cfg.ID, Path: "foo.txt", Type: "file", Mode: 0o644, ObjectOID: "aaa"}
+	s.EnsureCopyOnWrite(ctx, cfg, "foo.txt", base)
+	s.WriteFile(ctx, "foo.txt", 0, []byte("modified"))
+
+	// Also create a new file that was committed.
+	s.CreateFile(ctx, "new.txt", 0o644)
+
+	// And a whiteout for a file that was deleted in the commit.
+	s.Remove(ctx, "gone.txt")
+
+	// Reconcile against a base where:
+	// - foo.txt exists with different OID (was committed)
+	// - new.txt exists (was committed)
+	// - gone.txt doesn't exist (was removed)
+	baseLookup := func(path string) (model.BaseNode, bool) {
+		switch path {
+		case "foo.txt":
+			return model.BaseNode{Path: "foo.txt", ObjectOID: "bbb"}, true
+		case "new.txt":
+			return model.BaseNode{Path: "new.txt", ObjectOID: "ccc"}, true
+		default:
+			return model.BaseNode{}, false
+		}
+	}
+	if err := s.Reconcile(ctx, baseLookup); err != nil {
+		t.Fatal(err)
+	}
+
+	// All three entries should be removed.
+	if _, ok := s.Get("foo.txt"); ok {
+		t.Fatal("foo.txt should be removed (base OID changed)")
+	}
+	if _, ok := s.Get("new.txt"); ok {
+		t.Fatal("new.txt should be removed (now in base)")
+	}
+	if _, ok := s.Get("gone.txt"); ok {
+		t.Fatal("gone.txt whiteout should be removed (not in base)")
+	}
+}
+
+func TestReconcileKeepsValidEntries(t *testing.T) {
+	s, cfg := testStore(t)
+	ctx := context.Background()
+
+	// Modify foo.txt from base OID "aaa" -- but base hasn't changed.
+	base := model.BaseNode{RepoID: cfg.ID, Path: "foo.txt", Type: "file", Mode: 0o644, ObjectOID: "aaa"}
+	s.EnsureCopyOnWrite(ctx, cfg, "foo.txt", base)
+	s.WriteFile(ctx, "foo.txt", 0, []byte("local change"))
+
+	// Create a file that doesn't exist in base.
+	s.CreateFile(ctx, "local-only.txt", 0o644)
+
+	// Whiteout a file that still exists in base.
+	s.Remove(ctx, "hidden.txt")
+
+	baseLookup := func(path string) (model.BaseNode, bool) {
+		switch path {
+		case "foo.txt":
+			// Same OID as source_oid -- base unchanged, keep overlay.
+			return model.BaseNode{Path: "foo.txt", ObjectOID: "aaa"}, true
+		case "hidden.txt":
+			return model.BaseNode{Path: "hidden.txt", ObjectOID: "ddd"}, true
+		default:
+			return model.BaseNode{}, false
+		}
+	}
+	if err := s.Reconcile(ctx, baseLookup); err != nil {
+		t.Fatal(err)
+	}
+
+	// All three entries should be kept.
+	if _, ok := s.Get("foo.txt"); !ok {
+		t.Fatal("foo.txt should be kept (base OID unchanged)")
+	}
+	if _, ok := s.Get("local-only.txt"); !ok {
+		t.Fatal("local-only.txt should be kept (not in base)")
+	}
+	if !s.HasWhiteout("hidden.txt") {
+		t.Fatal("hidden.txt whiteout should be kept (still in base)")
+	}
+}
+
+func TestReconcileNilLookup(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+	s.CreateFile(ctx, "a.txt", 0o644)
+
+	// nil baseLookup should be a no-op.
+	if err := s.Reconcile(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.Get("a.txt"); !ok {
+		t.Fatal("entry should survive nil reconcile")
+	}
+}
+
 func TestSetMtime(t *testing.T) {
 	s, _ := testStore(t)
 	ctx := context.Background()

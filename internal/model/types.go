@@ -124,6 +124,8 @@ type GitStore interface {
 	BuildTreeIndex(ctx context.Context, repo RepoConfig, headOID string) ([]BaseNode, error)
 	BlobToCache(ctx context.Context, repo RepoConfig, objectOID string, dstPath string) (size int64, err error)
 	ComputeAheadBehind(ctx context.Context, repo RepoConfig) (ahead int, behind int, diverged bool, err error)
+	CommitTimestamp(ctx context.Context, repo RepoConfig, oid string) (int64, error)
+	ReadTreeHEAD(ctx context.Context, repo RepoConfig) error
 }
 
 type SnapshotStore interface {
@@ -142,7 +144,7 @@ type OverlayStore interface {
 	Rename(ctx context.Context, oldPath, newPath string) error
 	Mkdir(ctx context.Context, path string, mode uint32) error
 	SetMtime(ctx context.Context, path string, t time.Time) error
-	Reconcile(ctx context.Context, newGeneration int64) error
+	Reconcile(ctx context.Context, baseLookup func(path string) (BaseNode, bool)) error
 	DirtyCount(ctx context.Context) (int64, error)
 	ListByPrefix(ctx context.Context, prefix string) ([]OverlayEntry, error)
 }

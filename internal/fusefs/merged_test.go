@@ -54,8 +54,10 @@ func (f *fakeOverlay) Remove(_ context.Context, _ string) error                {
 func (f *fakeOverlay) Rename(_ context.Context, _, _ string) error             { return nil }
 func (f *fakeOverlay) Mkdir(_ context.Context, _ string, _ uint32) error       { return nil }
 func (f *fakeOverlay) SetMtime(_ context.Context, _ string, _ time.Time) error { return nil }
-func (f *fakeOverlay) Reconcile(_ context.Context, _ int64) error              { return nil }
-func (f *fakeOverlay) DirtyCount(_ context.Context) (int64, error)             { return 0, nil }
+func (f *fakeOverlay) Reconcile(_ context.Context, _ func(string) (model.BaseNode, bool)) error {
+	return nil
+}
+func (f *fakeOverlay) DirtyCount(_ context.Context) (int64, error) { return 0, nil }
 
 func newResolver(snap *fakeSnapshot, ov *fakeOverlay) *Resolver {
 	r := &Resolver{RepoID: "repo", Snapshot: snap, Overlay: ov}
@@ -106,17 +108,36 @@ func TestGetattrReturnsMtime(t *testing.T) {
 	}
 }
 
-func TestGetattrBaseFileUsesGenerationEpoch(t *testing.T) {
+func TestGetattrBaseFileUsesCommitTime(t *testing.T) {
 	r := newResolver(
 		&fakeSnapshot{nodes: map[string]model.BaseNode{"b.txt": {Path: "b.txt", Type: "file", Mode: 0o644, SizeState: "known", SizeBytes: 5}}},
 		&fakeOverlay{entries: map[string]model.OverlayEntry{}, white: map[string]bool{}},
 	)
+	// Set a realistic commit timestamp.
+	commitTS := int64(1700000000) // 2023-11-14
+	r.SetCommitTime(commitTS)
+
 	_, _, _, mt, err := r.Getattr("b.txt")
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Should be time.Unix(generation, 0) = time.Unix(1, 0)
-	expected := time.Unix(1, 0)
+	expected := time.Unix(commitTS, 0)
+	if !mt.Equal(expected) {
+		t.Fatalf("mtime = %v, want %v", mt, expected)
+	}
+}
+
+func TestGetattrBaseFileFallsBackToGeneration(t *testing.T) {
+	r := newResolver(
+		&fakeSnapshot{nodes: map[string]model.BaseNode{"b.txt": {Path: "b.txt", Type: "file", Mode: 0o644, SizeState: "known", SizeBytes: 5}}},
+		&fakeOverlay{entries: map[string]model.OverlayEntry{}, white: map[string]bool{}},
+	)
+	// Don't set commit time -- should fall back to generation.
+	_, _, _, mt, err := r.Getattr("b.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := time.Unix(1, 0) // generation = 1
 	if !mt.Equal(expected) {
 		t.Fatalf("mtime = %v, want %v", mt, expected)
 	}
