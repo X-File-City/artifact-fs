@@ -28,18 +28,8 @@ var migrations = []string{
 	  PRIMARY KEY (generation, path)
 	);`,
 	`CREATE INDEX IF NOT EXISTS idx_base_nodes_gen_parent ON base_nodes(generation, parent_path);`,
-	`CREATE TABLE IF NOT EXISTS learned_path_stats (
-	  path TEXT PRIMARY KEY,
-	  access_count INTEGER NOT NULL DEFAULT 0,
-	  last_access_ns INTEGER NOT NULL DEFAULT 0,
-	  last_hydrated_ns INTEGER NOT NULL DEFAULT 0
-	);`,
-	`CREATE TABLE IF NOT EXISTS blob_cache_index (
-	  object_oid TEXT PRIMARY KEY,
-	  cache_path TEXT NOT NULL,
-	  size_bytes INTEGER NOT NULL DEFAULT 0,
-	  last_access_ns INTEGER NOT NULL DEFAULT 0
-	);`,
+	`DROP TABLE IF EXISTS learned_path_stats;`,
+	`DROP TABLE IF EXISTS blob_cache_index;`,
 }
 
 type Store struct {
@@ -63,7 +53,7 @@ func New(ctx context.Context, path string) (*Store, error) {
 
 func (s *Store) Close() error { return s.db.Close() }
 
-func (s *Store) PublishGeneration(ctx context.Context, repoID model.RepoID, headOID string, ref string, nodes []model.BaseNode) (int64, error) {
+func (s *Store) PublishGeneration(ctx context.Context, headOID string, ref string, nodes []model.BaseNode) (int64, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
@@ -130,7 +120,7 @@ func (s *Store) ReadState(ctx context.Context) (headOID, headRef string, generat
 	return headOID, headRef, gen, nil
 }
 
-func (s *Store) GetNode(_ model.RepoID, generation int64, path string) (model.BaseNode, bool) {
+func (s *Store) GetNode(generation int64, path string) (model.BaseNode, bool) {
 	// Uses background context for backward compat; callers with a deadline
 	// should use GetNodeCtx.
 	return s.GetNodeCtx(context.Background(), generation, path)
@@ -147,7 +137,7 @@ func (s *Store) GetNodeCtx(ctx context.Context, generation int64, path string) (
 
 // ListChildren returns direct children of parentPath using a path-based lookup
 // (no inode join, no collision risk).
-func (s *Store) ListChildren(_ model.RepoID, generation int64, parentPath string) ([]model.BaseNode, error) {
+func (s *Store) ListChildren(generation int64, parentPath string) ([]model.BaseNode, error) {
 	pp := model.CleanPath(parentPath)
 	rows, err := s.db.Query(`SELECT path, type, mode, object_oid, size_state, size_bytes FROM base_nodes WHERE generation=? AND parent_path=? ORDER BY path`, generation, pp)
 	if err != nil {

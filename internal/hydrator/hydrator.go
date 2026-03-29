@@ -26,8 +26,8 @@ type Service struct {
 	fetcher    BlobFetcher
 	mu         sync.Mutex
 	pq         priorityQueue
-	wait       map[string][]chan result
-	verifying  map[string][]chan verifyResult
+	wait       inflight[result]
+	verifying  inflight[verifyResult]
 	started    bool
 	stopOnce   sync.Once
 	stopCh     chan struct{}
@@ -50,8 +50,8 @@ type verifyResult struct {
 func New(fetcher BlobFetcher) *Service {
 	return &Service{
 		fetcher:   fetcher,
-		wait:      map[string][]chan result{},
-		verifying: map[string][]chan verifyResult{},
+		wait:      newInflight[result](),
+		verifying: newInflight[verifyResult](),
 		stopCh:    make(chan struct{}),
 		workReady: make(chan struct{}, 1),
 		verified:  map[string]struct{}{},
@@ -89,10 +89,10 @@ func (s *Service) Start(workers int, repo model.RepoConfig) {
 func (s *Service) Stop() {
 	s.stopOnce.Do(func() {
 		close(s.stopCh)
-		// Drain pending waiters so they don't block forever
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		s.stopWaitersLocked(errors.New("hydrator stopped"))
+		s.wait.closeAll(result{err: errors.New("hydrator stopped")})
+		s.verifying.closeAll(verifyResult{err: errors.New("hydrator stopped")})
 	})
 }
 
@@ -112,7 +112,12 @@ func (s *Service) EnsureHydrated(ctx context.Context, repo model.RepoConfig, nod
 	}
 	key := taskKey(repo.ID, node.ObjectOID)
 	ch := make(chan result, 1)
-	first := s.registerWaiter(key, ch, explicitReadTask(repo.ID, node.Path, node.ObjectOID))
+	s.mu.Lock()
+	first := s.wait.add(key, ch)
+	if first {
+		heap.Push(&s.pq, &taskItem{task: explicitReadTask(repo.ID, node.Path, node.ObjectOID)})
+	}
+	s.mu.Unlock()
 	if first {
 		s.signalWork()
 	}
@@ -121,7 +126,9 @@ func (s *Service) EnsureHydrated(ctx context.Context, repo model.RepoConfig, nod
 	case <-ctx.Done():
 		// Remove our channel from the wait list so the worker doesn't
 		// send to an abandoned channel that nobody reads.
-		s.removeWaiter(key, ch)
+		s.mu.Lock()
+		s.wait.remove(key, ch)
+		s.mu.Unlock()
 		return "", 0, ctx.Err()
 	case r := <-ch:
 		return r.cachePath, r.size, r.err
@@ -198,22 +205,21 @@ func (s *Service) verifyBlobOnce(ctx context.Context, key string, verify func(co
 		return true, nil
 	}
 	ch := make(chan verifyResult, 1)
-	if waiters, ok := s.verifying[key]; ok {
-		s.verifying[key] = append(waiters, ch)
-		s.mu.Unlock()
-		return s.awaitVerification(ctx, key, ch)
-	}
-	s.verifying[key] = []chan verifyResult{ch}
+	first := s.verifying.add(key, ch)
 	s.mu.Unlock()
 
-	go s.runVerification(key, verify)
+	if first {
+		go s.runVerification(key, verify)
+	}
 	return s.awaitVerification(ctx, key, ch)
 }
 
 func (s *Service) awaitVerification(ctx context.Context, key string, ch chan verifyResult) (bool, error) {
 	select {
 	case <-ctx.Done():
-		s.removeVerificationWaiter(key, ch)
+		s.mu.Lock()
+		s.verifying.remove(key, ch)
+		s.mu.Unlock()
 		return false, ctx.Err()
 	case r := <-ch:
 		return r.ok, r.err
@@ -238,31 +244,10 @@ func (s *Service) runVerification(key string, verify func(context.Context) (bool
 	if err == nil && ok {
 		s.verified[key] = struct{}{}
 	}
-	waiters := s.verifying[key]
-	delete(s.verifying, key)
+	waiters := s.verifying.take(key)
 	s.mu.Unlock()
 
-	for _, ch := range waiters {
-		ch <- r
-		close(ch)
-	}
-}
-
-func (s *Service) removeVerificationWaiter(key string, ch chan verifyResult) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	waiters, ok := s.verifying[key]
-	if !ok {
-		return
-	}
-	for i, waiter := range waiters {
-		if waiter != ch {
-			continue
-		}
-		waiters = append(waiters[:i], waiters[i+1:]...)
-		s.verifying[key] = waiters
-		return
-	}
+	notifyWaiters(waiters, r)
 }
 
 func (s *Service) QueueDepth(repoID model.RepoID) int {
@@ -306,12 +291,12 @@ func (s *Service) step(repo model.RepoConfig) bool {
 	}
 	item := heap.Pop(&s.pq).(*taskItem)
 	key := taskKey(item.task.RepoID, item.task.ObjectOID)
-	waits := s.takeWaitersLocked(key)
+	waits := s.wait.take(key)
 	s.mu.Unlock()
 
 	cachePath := cachePathFor(repo, item.task.ObjectOID)
 	if err := os.MkdirAll(filepath.Dir(cachePath), 0o755); err != nil {
-		s.notify(waits, result{err: err})
+		notifyWaiters(waits, result{err: err})
 		return true
 	}
 	// Use a timeout context derived from stopCh so stuck blob fetches don't
@@ -327,11 +312,11 @@ func (s *Service) step(repo model.RepoConfig) bool {
 	}()
 	size, err := s.fetcher.BlobToCache(fetchCtx, repo, item.task.ObjectOID, cachePath)
 	if err != nil {
-		s.notify(waits, result{err: fmt.Errorf("hydrate %s: %w", item.task.Path, err)})
+		notifyWaiters(waits, result{err: fmt.Errorf("hydrate %s: %w", item.task.Path, err)})
 		return true
 	}
 	s.markVerified(taskKey(item.task.RepoID, item.task.ObjectOID))
-	s.notify(waits, result{cachePath: cachePath, size: size, err: nil})
+	notifyWaiters(waits, result{cachePath: cachePath, size: size, err: nil})
 	s.mu.Lock()
 	fn := s.onHydrated
 	s.mu.Unlock()
@@ -339,13 +324,6 @@ func (s *Service) step(repo model.RepoConfig) bool {
 		fn(item.task.RepoID, item.task.ObjectOID, size)
 	}
 	return true
-}
-
-func (s *Service) notify(chans []chan result, r result) {
-	for _, ch := range chans {
-		ch <- r
-		close(ch)
-	}
 }
 
 func taskKey(repoID model.RepoID, oid string) string {
@@ -364,54 +342,6 @@ func explicitReadTask(repoID model.RepoID, path string, oid string) model.Hydrat
 		Priority:   PriorityExplicitRead,
 		Reason:     "explicit read",
 		EnqueuedAt: time.Now(),
-	}
-}
-
-func (s *Service) registerWaiter(key string, ch chan result, task model.HydrationTask) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.wait[key] = append(s.wait[key], ch)
-	first := len(s.wait[key]) == 1
-	if first {
-		heap.Push(&s.pq, &taskItem{task: task})
-	}
-	return first
-}
-
-func (s *Service) removeWaiter(key string, ch chan result) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	chans, ok := s.wait[key]
-	if !ok {
-		return
-	}
-	for i, waiter := range chans {
-		if waiter != ch {
-			continue
-		}
-		chans = append(chans[:i], chans[i+1:]...)
-		if len(chans) == 0 {
-			delete(s.wait, key)
-		} else {
-			s.wait[key] = chans
-		}
-		return
-	}
-}
-
-func (s *Service) takeWaitersLocked(key string) []chan result {
-	waits := s.wait[key]
-	delete(s.wait, key)
-	return waits
-}
-
-func (s *Service) stopWaitersLocked(err error) {
-	for key, chans := range s.wait {
-		for _, ch := range chans {
-			ch <- result{err: err}
-			close(ch)
-		}
-		delete(s.wait, key)
 	}
 }
 

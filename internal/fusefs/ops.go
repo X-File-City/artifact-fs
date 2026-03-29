@@ -40,10 +40,10 @@ func (e *Engine) ensureOverlay(ctx context.Context, path string) error {
 }
 
 func (e *Engine) Read(ctx context.Context, path string, off int64, size int) ([]byte, error) {
-	if e.Overlay.HasWhiteout(path) {
-		return nil, os.ErrNotExist
-	}
-	if ov, ok := e.Overlay.Get(path); ok && ov.Kind != "delete" {
+	if ov, ok := e.Overlay.Get(path); ok {
+		if ov.IsDeleted() {
+			return nil, os.ErrNotExist
+		}
 		return readFileChunk(ov.BackingPath, off, size)
 	}
 	n, err := e.Resolver.ResolvePath(path)
@@ -138,7 +138,7 @@ func (e *Engine) PrefetchDir(dirPath string, entries []ReaddirEntry) {
 			continue
 		}
 		childPath := model.CleanPath(filepath.Join(dirPath, entry.Name))
-		n, ok := e.Resolver.Snapshot.GetNode(e.Repo.ID, gen, childPath)
+		n, ok := e.Resolver.Snapshot.GetNode(gen, childPath)
 		if !ok || n.ObjectOID == "" {
 			continue
 		}

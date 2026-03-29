@@ -111,6 +111,42 @@ func (fs *ArtifactFuse) getInode(id fuseops.InodeID) *InodeRef {
 	return ref
 }
 
+func (fs *ArtifactFuse) requireInode(id fuseops.InodeID, missing error) (*InodeRef, error) {
+	ref := fs.getInode(id)
+	if ref == nil {
+		return nil, missing
+	}
+	return ref, nil
+}
+
+func (fs *ArtifactFuse) childPath(parentID fuseops.InodeID, name string) (*InodeRef, string, error) {
+	parent, err := fs.requireInode(parentID, syscall.ENOENT)
+	if err != nil {
+		return nil, "", err
+	}
+	return parent, cleanChildPath(parent.Path, name), nil
+}
+
+func (fs *ArtifactFuse) dirHandle(handleID fuseops.HandleID) (*DirHandle, error) {
+	fs.mu.RLock()
+	dh := fs.dirHandles[handleID]
+	fs.mu.RUnlock()
+	if dh == nil {
+		return nil, syscall.EBADF
+	}
+	return dh, nil
+}
+
+func (fs *ArtifactFuse) fileHandle(handleID fuseops.HandleID) (*FileHandle, error) {
+	fs.mu.RLock()
+	fh := fs.fileHandles[handleID]
+	fs.mu.RUnlock()
+	if fh == nil {
+		return nil, syscall.EBADF
+	}
+	return fh, nil
+}
+
 // --- FUSE operations ---
 
 func (fs *ArtifactFuse) StatFS(_ context.Context, op *fuseops.StatFSOp) error {
@@ -128,9 +164,9 @@ func (fs *ArtifactFuse) StatFS(_ context.Context, op *fuseops.StatFSOp) error {
 }
 
 func (fs *ArtifactFuse) LookUpInode(_ context.Context, op *fuseops.LookUpInodeOp) error {
-	parent := fs.getInode(op.Parent)
-	if parent == nil {
-		return syscall.ENOENT
+	parent, err := fs.requireInode(op.Parent, syscall.ENOENT)
+	if err != nil {
+		return err
 	}
 
 	childPath := cleanChildPath(parent.Path, op.Name)
@@ -165,9 +201,9 @@ func (fs *ArtifactFuse) LookUpInode(_ context.Context, op *fuseops.LookUpInodeOp
 }
 
 func (fs *ArtifactFuse) GetInodeAttributes(_ context.Context, op *fuseops.GetInodeAttributesOp) error {
-	ref := fs.getInode(op.Inode)
-	if ref == nil {
-		return syscall.ESTALE
+	ref, err := fs.requireInode(op.Inode, syscall.ESTALE)
+	if err != nil {
+		return err
 	}
 
 	if ref.Path == ".git" {
@@ -186,9 +222,9 @@ func (fs *ArtifactFuse) GetInodeAttributes(_ context.Context, op *fuseops.GetIno
 }
 
 func (fs *ArtifactFuse) SetInodeAttributes(ctx context.Context, op *fuseops.SetInodeAttributesOp) error {
-	ref := fs.getInode(op.Inode)
-	if ref == nil {
-		return syscall.ESTALE
+	ref, err := fs.requireInode(op.Inode, syscall.ESTALE)
+	if err != nil {
+		return err
 	}
 	if op.Size != nil {
 		if err := fs.engine.Truncate(ctx, ref.Path, int64(*op.Size)); err != nil {
@@ -227,9 +263,9 @@ func (fs *ArtifactFuse) ForgetInode(_ context.Context, op *fuseops.ForgetInodeOp
 }
 
 func (fs *ArtifactFuse) OpenDir(ctx context.Context, op *fuseops.OpenDirOp) error {
-	ref := fs.getInode(op.Inode)
-	if ref == nil {
-		return syscall.ESTALE
+	ref, err := fs.requireInode(op.Inode, syscall.ESTALE)
+	if err != nil {
+		return err
 	}
 	// Eagerly load children at open time to avoid races on concurrent ReadDir.
 	entries, err := fs.resolver.ReaddirTyped(ctx, ref.Path)
@@ -255,11 +291,9 @@ func (fs *ArtifactFuse) OpenDir(ctx context.Context, op *fuseops.OpenDirOp) erro
 }
 
 func (fs *ArtifactFuse) ReadDir(_ context.Context, op *fuseops.ReadDirOp) error {
-	fs.mu.RLock()
-	dh := fs.dirHandles[op.Handle]
-	fs.mu.RUnlock()
-	if dh == nil {
-		return syscall.EBADF
+	dh, err := fs.dirHandle(op.Handle)
+	if err != nil {
+		return err
 	}
 
 	offset := int(op.Offset)
@@ -295,9 +329,9 @@ func (fs *ArtifactFuse) ReleaseDirHandle(_ context.Context, op *fuseops.ReleaseD
 }
 
 func (fs *ArtifactFuse) OpenFile(_ context.Context, op *fuseops.OpenFileOp) error {
-	ref := fs.getInode(op.Inode)
-	if ref == nil {
-		return syscall.ESTALE
+	ref, err := fs.requireInode(op.Inode, syscall.ESTALE)
+	if err != nil {
+		return err
 	}
 	fh := &FileHandle{inode: ref, path: ref.Path}
 	fs.mu.Lock()
@@ -311,11 +345,9 @@ func (fs *ArtifactFuse) OpenFile(_ context.Context, op *fuseops.OpenFileOp) erro
 }
 
 func (fs *ArtifactFuse) ReadFile(ctx context.Context, op *fuseops.ReadFileOp) error {
-	fs.mu.RLock()
-	fh := fs.fileHandles[op.Handle]
-	fs.mu.RUnlock()
-	if fh == nil {
-		return syscall.EBADF
+	fh, err := fs.fileHandle(op.Handle)
+	if err != nil {
+		return err
 	}
 
 	if fh.path == ".git" {
@@ -346,13 +378,11 @@ func (fs *ArtifactFuse) ReadFile(ctx context.Context, op *fuseops.ReadFileOp) er
 }
 
 func (fs *ArtifactFuse) WriteFile(ctx context.Context, op *fuseops.WriteFileOp) error {
-	fs.mu.RLock()
-	fh := fs.fileHandles[op.Handle]
-	fs.mu.RUnlock()
-	if fh == nil {
-		return syscall.EBADF
+	fh, err := fs.fileHandle(op.Handle)
+	if err != nil {
+		return err
 	}
-	_, err := fs.engine.Write(ctx, fh.path, op.Offset, op.Data)
+	_, err = fs.engine.Write(ctx, fh.path, op.Offset, op.Data)
 	if err != nil {
 		return syscall.EIO
 	}
@@ -360,11 +390,10 @@ func (fs *ArtifactFuse) WriteFile(ctx context.Context, op *fuseops.WriteFileOp) 
 }
 
 func (fs *ArtifactFuse) CreateFile(ctx context.Context, op *fuseops.CreateFileOp) error {
-	parent := fs.getInode(op.Parent)
-	if parent == nil {
-		return syscall.ENOENT
+	_, childPath, err := fs.childPath(op.Parent, op.Name)
+	if err != nil {
+		return err
 	}
-	childPath := cleanChildPath(parent.Path, op.Name)
 	if err := fs.engine.Create(ctx, childPath, uint32(op.Mode)); err != nil {
 		return syscall.EIO
 	}
@@ -384,11 +413,10 @@ func (fs *ArtifactFuse) CreateFile(ctx context.Context, op *fuseops.CreateFileOp
 }
 
 func (fs *ArtifactFuse) MkDir(ctx context.Context, op *fuseops.MkDirOp) error {
-	parent := fs.getInode(op.Parent)
-	if parent == nil {
-		return syscall.ENOENT
+	_, childPath, err := fs.childPath(op.Parent, op.Name)
+	if err != nil {
+		return err
 	}
-	childPath := cleanChildPath(parent.Path, op.Name)
 	if err := fs.engine.Mkdir(ctx, childPath, uint32(op.Mode)); err != nil {
 		return syscall.EIO
 	}
@@ -403,11 +431,10 @@ func (fs *ArtifactFuse) MkDir(ctx context.Context, op *fuseops.MkDirOp) error {
 }
 
 func (fs *ArtifactFuse) RmDir(ctx context.Context, op *fuseops.RmDirOp) error {
-	parent := fs.getInode(op.Parent)
-	if parent == nil {
-		return syscall.ENOENT
+	_, childPath, err := fs.childPath(op.Parent, op.Name)
+	if err != nil {
+		return err
 	}
-	childPath := cleanChildPath(parent.Path, op.Name)
 	if err := fs.engine.Rmdir(ctx, childPath); err != nil {
 		if os.IsExist(err) {
 			return syscall.ENOTEMPTY
@@ -418,11 +445,10 @@ func (fs *ArtifactFuse) RmDir(ctx context.Context, op *fuseops.RmDirOp) error {
 }
 
 func (fs *ArtifactFuse) Unlink(ctx context.Context, op *fuseops.UnlinkOp) error {
-	parent := fs.getInode(op.Parent)
-	if parent == nil {
-		return syscall.ENOENT
+	_, childPath, err := fs.childPath(op.Parent, op.Name)
+	if err != nil {
+		return err
 	}
-	childPath := cleanChildPath(parent.Path, op.Name)
 	if err := fs.engine.Unlink(ctx, childPath); err != nil {
 		return syscall.EIO
 	}
@@ -430,10 +456,13 @@ func (fs *ArtifactFuse) Unlink(ctx context.Context, op *fuseops.UnlinkOp) error 
 }
 
 func (fs *ArtifactFuse) Rename(ctx context.Context, op *fuseops.RenameOp) error {
-	oldParent := fs.getInode(op.OldParent)
-	newParent := fs.getInode(op.NewParent)
-	if oldParent == nil || newParent == nil {
-		return syscall.ENOENT
+	oldParent, err := fs.requireInode(op.OldParent, syscall.ENOENT)
+	if err != nil {
+		return err
+	}
+	newParent, err := fs.requireInode(op.NewParent, syscall.ENOENT)
+	if err != nil {
+		return err
 	}
 	oldPath := cleanChildPath(oldParent.Path, op.OldName)
 	newPath := cleanChildPath(newParent.Path, op.NewName)
@@ -444,9 +473,9 @@ func (fs *ArtifactFuse) Rename(ctx context.Context, op *fuseops.RenameOp) error 
 }
 
 func (fs *ArtifactFuse) ReadSymlink(ctx context.Context, op *fuseops.ReadSymlinkOp) error {
-	ref := fs.getInode(op.Inode)
-	if ref == nil {
-		return syscall.ESTALE
+	ref, err := fs.requireInode(op.Inode, syscall.ESTALE)
+	if err != nil {
+		return err
 	}
 	n, err := fs.resolver.ResolvePath(ref.Path)
 	if err != nil {

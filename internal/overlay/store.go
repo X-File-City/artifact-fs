@@ -68,15 +68,10 @@ func (s *Store) Get(path string) (model.OverlayEntry, bool) {
 	return e, true
 }
 
-func (s *Store) HasWhiteout(path string) bool {
-	e, ok := s.Get(path)
-	return ok && e.Kind == "delete"
-}
-
 // EnsureCopyOnWrite promotes a base file into the overlay. If the blob is not
 // cached, an empty overlay file is created and the caller must hydrate first.
 func (s *Store) EnsureCopyOnWrite(ctx context.Context, repo model.RepoConfig, path string, base model.BaseNode) (model.OverlayEntry, error) {
-	if e, ok := s.Get(path); ok && e.Kind != "delete" {
+	if e, ok := s.Get(path); ok && !e.IsDeleted() {
 		return e, nil
 	}
 	backing := s.backingPath(path)
@@ -106,7 +101,7 @@ func (s *Store) EnsureCopyOnWrite(ctx context.Context, repo model.RepoConfig, pa
 	e := model.OverlayEntry{
 		RepoID:      s.repo.ID,
 		Path:        model.CleanPath(path),
-		Kind:        "modify",
+		Kind:        model.OverlayKindModify,
 		BackingPath: backing,
 		Mode:        base.Mode,
 		SizeBytes:   st.Size(),
@@ -127,7 +122,7 @@ func (s *Store) CreateFile(ctx context.Context, path string, mode uint32) (model
 	if err := os.WriteFile(backing, nil, os.FileMode(mode)); err != nil {
 		return model.OverlayEntry{}, err
 	}
-	e := model.OverlayEntry{RepoID: s.repo.ID, Path: model.CleanPath(path), Kind: "create", BackingPath: backing, Mode: mode, MtimeUnixNs: time.Now().UnixNano()}
+	e := model.OverlayEntry{RepoID: s.repo.ID, Path: model.CleanPath(path), Kind: model.OverlayKindCreate, BackingPath: backing, Mode: mode, MtimeUnixNs: time.Now().UnixNano()}
 	if err := s.upsertEntry(ctx, e); err != nil {
 		return model.OverlayEntry{}, err
 	}
@@ -136,7 +131,7 @@ func (s *Store) CreateFile(ctx context.Context, path string, mode uint32) (model
 
 func (s *Store) WriteFile(ctx context.Context, path string, off int64, data []byte) (int, error) {
 	e, ok := s.Get(path)
-	if !ok || e.Kind == "delete" {
+	if !ok || e.IsDeleted() {
 		return 0, os.ErrNotExist
 	}
 	f, err := os.OpenFile(e.BackingPath, os.O_WRONLY|os.O_CREATE, os.FileMode(e.Mode))
@@ -151,8 +146,8 @@ func (s *Store) WriteFile(ctx context.Context, path string, off int64, data []by
 	st, _ := f.Stat()
 	e.SizeBytes = st.Size()
 	e.MtimeUnixNs = time.Now().UnixNano()
-	if e.Kind != "create" {
-		e.Kind = "modify"
+	if e.Kind != model.OverlayKindCreate {
+		e.Kind = model.OverlayKindModify
 	}
 	return n, s.upsertEntry(ctx, e)
 }
@@ -162,7 +157,7 @@ func (s *Store) Remove(ctx context.Context, path string) error {
 	if e, ok := s.Get(path); ok && e.BackingPath != "" {
 		_ = os.Remove(e.BackingPath)
 	}
-	e := model.OverlayEntry{RepoID: s.repo.ID, Path: path, Kind: "delete", Mode: 0, MtimeUnixNs: time.Now().UnixNano()}
+	e := model.OverlayEntry{RepoID: s.repo.ID, Path: path, Kind: model.OverlayKindDelete, Mode: 0, MtimeUnixNs: time.Now().UnixNano()}
 	return s.upsertEntry(ctx, e)
 }
 
@@ -170,7 +165,7 @@ func (s *Store) Rename(ctx context.Context, oldPath, newPath string) error {
 	oldPath = model.CleanPath(oldPath)
 	newPath = model.CleanPath(newPath)
 	e, ok := s.Get(oldPath)
-	if !ok || e.Kind == "delete" {
+	if !ok || e.IsDeleted() {
 		return os.ErrNotExist
 	}
 	newBacking := s.backingPath(newPath)
@@ -188,10 +183,10 @@ func (s *Store) Rename(ctx context.Context, oldPath, newPath string) error {
 	if _, err := tx.ExecContext(ctx, `DELETE FROM overlay_entries WHERE path=?`, oldPath); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO overlay_entries(path, kind, backing_path, mode, size_bytes, mtime_unix_ns, source_oid, target_path) VALUES(?,?,?,?,?,?,?,?)`, newPath, "rename", newBacking, e.Mode, e.SizeBytes, now, e.SourceOID, newPath); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO overlay_entries(path, kind, backing_path, mode, size_bytes, mtime_unix_ns, source_oid, target_path) VALUES(?,?,?,?,?,?,?,?)`, newPath, model.OverlayKindRename, newBacking, e.Mode, e.SizeBytes, now, e.SourceOID, newPath); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO overlay_entries(path, kind, backing_path, mode, size_bytes, mtime_unix_ns, source_oid, target_path) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET kind='delete',mtime_unix_ns=excluded.mtime_unix_ns`, oldPath, "delete", "", 0, 0, now, "", ""); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO overlay_entries(path, kind, backing_path, mode, size_bytes, mtime_unix_ns, source_oid, target_path) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET kind='delete',mtime_unix_ns=excluded.mtime_unix_ns`, oldPath, model.OverlayKindDelete, "", 0, 0, now, "", ""); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
@@ -216,7 +211,7 @@ func (s *Store) Mkdir(ctx context.Context, path string, mode uint32) error {
 	if err := os.MkdirAll(s.backingPath(path), os.FileMode(mode)); err != nil {
 		return err
 	}
-	e := model.OverlayEntry{RepoID: s.repo.ID, Path: path, Kind: "mkdir", BackingPath: s.backingPath(path), Mode: mode, MtimeUnixNs: time.Now().UnixNano()}
+	e := model.OverlayEntry{RepoID: s.repo.ID, Path: path, Kind: model.OverlayKindMkdir, BackingPath: s.backingPath(path), Mode: mode, MtimeUnixNs: time.Now().UnixNano()}
 	return s.upsertEntry(ctx, e)
 }
 
@@ -252,19 +247,19 @@ func (s *Store) Reconcile(ctx context.Context, baseLookup func(path string) (mod
 	for _, e := range entries {
 		base, baseExists := baseLookup(e.Path)
 		switch {
-		case e.Kind == "delete":
+		case e.Kind == model.OverlayKindDelete:
 			if !baseExists {
 				toRemove = append(toRemove, e)
 			}
-		case e.Kind == "create":
+		case e.Kind == model.OverlayKindCreate:
 			if baseExists {
 				toRemove = append(toRemove, e)
 			}
-		case e.Kind == "mkdir":
+		case e.Kind == model.OverlayKindMkdir:
 			if baseExists && base.Type == "dir" {
 				toRemove = append(toRemove, e)
 			}
-		case e.Kind == "modify" || e.Kind == "rename":
+		case e.Kind == model.OverlayKindModify || e.Kind == model.OverlayKindRename:
 			// Keep only if the base file still exists with the same OID the
 			// overlay was derived from. Otherwise the base changed (commit,
 			// branch switch) or disappeared and the overlay is stale.
@@ -311,7 +306,7 @@ func (s *Store) Reconcile(ctx context.Context, baseLookup func(path string) (mod
 }
 
 func (s *Store) DirtyCount(ctx context.Context) (int64, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM overlay_entries WHERE kind <> 'delete'`)
+	row := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM overlay_entries WHERE kind <> ?`, model.OverlayKindDelete)
 	var c int64
 	err := row.Scan(&c)
 	return c, err

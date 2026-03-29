@@ -35,12 +35,11 @@ func childName(parent, entryPath string) (string, bool) {
 }
 
 type SnapshotLookup interface {
-	GetNode(repoID model.RepoID, generation int64, path string) (model.BaseNode, bool)
-	ListChildren(repoID model.RepoID, generation int64, parentPath string) ([]model.BaseNode, error)
+	GetNode(generation int64, path string) (model.BaseNode, bool)
+	ListChildren(generation int64, parentPath string) ([]model.BaseNode, error)
 }
 
 type Resolver struct {
-	RepoID     model.RepoID
 	generation atomic.Int64
 	commitTime atomic.Int64 // unix seconds of HEAD commit
 	Snapshot   SnapshotLookup
@@ -60,13 +59,13 @@ type ResolvedNode struct {
 
 func (r *Resolver) ResolvePath(path string) (ResolvedNode, error) {
 	path = model.CleanPath(path)
-	if r.Overlay.HasWhiteout(path) {
-		return ResolvedNode{}, fs.ErrNotExist
-	}
-	if ov, ok := r.Overlay.Get(path); ok && ov.Kind != "delete" {
+	if ov, ok := r.Overlay.Get(path); ok {
+		if ov.IsDeleted() {
+			return ResolvedNode{}, fs.ErrNotExist
+		}
 		return ResolvedNode{FromOverlay: true, Overlay: ov}, nil
 	}
-	if n, ok := r.Snapshot.GetNode(r.RepoID, r.Generation(), path); ok {
+	if n, ok := r.Snapshot.GetNode(r.Generation(), path); ok {
 		return ResolvedNode{Base: n}, nil
 	}
 	return ResolvedNode{}, fs.ErrNotExist
@@ -86,7 +85,7 @@ func (r *Resolver) Getattr(path string) (mode uint32, size int64, nodeType strin
 		return 0, 0, "", time.Time{}, err
 	}
 	if n.FromOverlay {
-		typ := overlayNodeType(n.Overlay.Kind)
+		typ := n.Overlay.NodeType()
 		mt := time.Unix(0, n.Overlay.MtimeUnixNs)
 		return n.Overlay.Mode, n.Overlay.SizeBytes, typ, mt, nil
 	}
@@ -130,7 +129,7 @@ func (r *Resolver) Readdir(ctx context.Context, path string) ([]string, error) {
 // adapter doesn't need to call Getattr per child.
 func (r *Resolver) ReaddirTyped(ctx context.Context, path string) ([]ReaddirEntry, error) {
 	path = model.CleanPath(path)
-	children, err := r.Snapshot.ListChildren(r.RepoID, r.Generation(), path)
+	children, err := r.Snapshot.ListChildren(r.Generation(), path)
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return nil, err
 	}
@@ -153,14 +152,14 @@ func (r *Resolver) ReaddirTyped(ctx context.Context, path string) ([]ReaddirEntr
 				continue
 			}
 			childPath := model.CleanPath(filepath.Join(path, name))
-			if e.Kind == "delete" && e.Path == childPath {
+			if e.IsDeleted() && e.Path == childPath {
 				delete(set, name)
 				continue
 			}
-			if r.Overlay.HasWhiteout(childPath) {
+			if ov, ok := r.Overlay.Get(childPath); ok && ov.IsDeleted() {
 				continue
 			}
-			typ := overlayNodeType(e.Kind)
+			typ := e.NodeType()
 			set[name] = entry{name: name, typ: typ}
 		}
 	}
@@ -170,15 +169,4 @@ func (r *Resolver) ReaddirTyped(ctx context.Context, path string) ([]ReaddirEntr
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out, nil
-}
-
-func overlayNodeType(kind string) string {
-	switch kind {
-	case "mkdir":
-		return "dir"
-	case "symlink":
-		return "symlink"
-	default:
-		return "file"
-	}
 }

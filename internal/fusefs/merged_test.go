@@ -14,12 +14,12 @@ type fakeSnapshot struct {
 	kids  map[string][]model.BaseNode
 }
 
-func (f *fakeSnapshot) GetNode(_ model.RepoID, _ int64, path string) (model.BaseNode, bool) {
+func (f *fakeSnapshot) GetNode(_ int64, path string) (model.BaseNode, bool) {
 	n, ok := f.nodes[path]
 	return n, ok
 }
 
-func (f *fakeSnapshot) ListChildren(_ model.RepoID, _ int64, path string) ([]model.BaseNode, error) {
+func (f *fakeSnapshot) ListChildren(_ int64, path string) ([]model.BaseNode, error) {
 	if v, ok := f.kids[path]; ok {
 		return v, nil
 	}
@@ -29,7 +29,6 @@ func (f *fakeSnapshot) ListChildren(_ model.RepoID, _ int64, path string) ([]mod
 // fakeOverlay satisfies model.OverlayStore for testing.
 type fakeOverlay struct {
 	entries map[string]model.OverlayEntry
-	white   map[string]bool
 	list    []model.OverlayEntry
 }
 
@@ -37,7 +36,6 @@ func (f *fakeOverlay) Get(path string) (model.OverlayEntry, bool) {
 	v, ok := f.entries[path]
 	return v, ok
 }
-func (f *fakeOverlay) HasWhiteout(path string) bool { return f.white[path] }
 func (f *fakeOverlay) ListByPrefix(_ context.Context, _ string) ([]model.OverlayEntry, error) {
 	return f.list, nil
 }
@@ -60,7 +58,7 @@ func (f *fakeOverlay) Reconcile(_ context.Context, _ func(string) (model.BaseNod
 func (f *fakeOverlay) DirtyCount(_ context.Context) (int64, error) { return 0, nil }
 
 func newResolver(snap *fakeSnapshot, ov *fakeOverlay) *Resolver {
-	r := &Resolver{RepoID: "repo", Snapshot: snap, Overlay: ov}
+	r := &Resolver{Snapshot: snap, Overlay: ov}
 	r.SetGeneration(1)
 	return r
 }
@@ -68,7 +66,7 @@ func newResolver(snap *fakeSnapshot, ov *fakeOverlay) *Resolver {
 func TestResolvePrefersWhiteout(t *testing.T) {
 	r := newResolver(
 		&fakeSnapshot{nodes: map[string]model.BaseNode{"a.txt": {Path: "a.txt", Type: "file", Mode: 0o644}}},
-		&fakeOverlay{white: map[string]bool{"a.txt": true}, entries: map[string]model.OverlayEntry{}},
+		&fakeOverlay{entries: map[string]model.OverlayEntry{"a.txt": {Path: "a.txt", Kind: model.OverlayKindDelete}}},
 	)
 	_, err := r.ResolvePath("a.txt")
 	if err == nil {
@@ -79,7 +77,7 @@ func TestResolvePrefersWhiteout(t *testing.T) {
 func TestResolveOverlayTakesPrecedence(t *testing.T) {
 	r := newResolver(
 		&fakeSnapshot{nodes: map[string]model.BaseNode{"f.txt": {Path: "f.txt", Type: "file", Mode: 0o644, ObjectOID: "base"}}},
-		&fakeOverlay{entries: map[string]model.OverlayEntry{"f.txt": {Path: "f.txt", Kind: "modify", Mode: 0o644}}, white: map[string]bool{}},
+		&fakeOverlay{entries: map[string]model.OverlayEntry{"f.txt": {Path: "f.txt", Kind: model.OverlayKindModify, Mode: 0o644}}},
 	)
 	n, err := r.ResolvePath("f.txt")
 	if err != nil {
@@ -95,8 +93,7 @@ func TestGetattrReturnsMtime(t *testing.T) {
 	r := newResolver(
 		&fakeSnapshot{},
 		&fakeOverlay{
-			entries: map[string]model.OverlayEntry{"x.txt": {Path: "x.txt", Kind: "create", Mode: 0o644, SizeBytes: 10, MtimeUnixNs: mtime}},
-			white:   map[string]bool{},
+			entries: map[string]model.OverlayEntry{"x.txt": {Path: "x.txt", Kind: model.OverlayKindCreate, Mode: 0o644, SizeBytes: 10, MtimeUnixNs: mtime}},
 		},
 	)
 	_, _, _, mt, err := r.Getattr("x.txt")
@@ -111,7 +108,7 @@ func TestGetattrReturnsMtime(t *testing.T) {
 func TestGetattrBaseFileUsesCommitTime(t *testing.T) {
 	r := newResolver(
 		&fakeSnapshot{nodes: map[string]model.BaseNode{"b.txt": {Path: "b.txt", Type: "file", Mode: 0o644, SizeState: "known", SizeBytes: 5}}},
-		&fakeOverlay{entries: map[string]model.OverlayEntry{}, white: map[string]bool{}},
+		&fakeOverlay{entries: map[string]model.OverlayEntry{}},
 	)
 	// Set a realistic commit timestamp.
 	commitTS := int64(1700000000) // 2023-11-14
@@ -130,7 +127,7 @@ func TestGetattrBaseFileUsesCommitTime(t *testing.T) {
 func TestGetattrBaseFileFallsBackToGeneration(t *testing.T) {
 	r := newResolver(
 		&fakeSnapshot{nodes: map[string]model.BaseNode{"b.txt": {Path: "b.txt", Type: "file", Mode: 0o644, SizeState: "known", SizeBytes: 5}}},
-		&fakeOverlay{entries: map[string]model.OverlayEntry{}, white: map[string]bool{}},
+		&fakeOverlay{entries: map[string]model.OverlayEntry{}},
 	)
 	// Don't set commit time -- should fall back to generation.
 	_, _, _, mt, err := r.Getattr("b.txt")
@@ -155,8 +152,7 @@ func TestReaddirMergesSnapshotAndOverlay(t *testing.T) {
 		},
 		&fakeOverlay{
 			entries: map[string]model.OverlayEntry{},
-			white:   map[string]bool{},
-			list:    []model.OverlayEntry{{Path: "c.txt", Kind: "create"}},
+			list:    []model.OverlayEntry{{Path: "c.txt", Kind: model.OverlayKindCreate}},
 		},
 	)
 	names, err := r.Readdir(context.Background(), ".")
@@ -180,9 +176,8 @@ func TestReaddirWhiteoutRemovesEntry(t *testing.T) {
 			},
 		},
 		&fakeOverlay{
-			entries: map[string]model.OverlayEntry{},
-			white:   map[string]bool{"del.txt": true},
-			list:    []model.OverlayEntry{{Path: "del.txt", Kind: "delete"}},
+			entries: map[string]model.OverlayEntry{"del.txt": {Path: "del.txt", Kind: model.OverlayKindDelete}},
+			list:    []model.OverlayEntry{{Path: "del.txt", Kind: model.OverlayKindDelete}},
 		},
 	)
 	names, err := r.Readdir(context.Background(), ".")
@@ -216,7 +211,7 @@ func TestReaddirTypedReturnsTypes(t *testing.T) {
 				},
 			},
 		},
-		&fakeOverlay{entries: map[string]model.OverlayEntry{}, white: map[string]bool{}},
+		&fakeOverlay{entries: map[string]model.OverlayEntry{}},
 	)
 	entries, err := r.ReaddirTyped(context.Background(), ".")
 	if err != nil {

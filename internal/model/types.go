@@ -53,16 +53,42 @@ type BaseNode struct {
 	SizeBytes int64
 }
 
+type OverlayKind string
+
+const (
+	OverlayKindCreate  OverlayKind = "create"
+	OverlayKindModify  OverlayKind = "modify"
+	OverlayKindDelete  OverlayKind = "delete"
+	OverlayKindRename  OverlayKind = "rename"
+	OverlayKindMkdir   OverlayKind = "mkdir"
+	OverlayKindSymlink OverlayKind = "symlink"
+)
+
 type OverlayEntry struct {
 	RepoID      RepoID
 	Path        string
-	Kind        string // create, modify, delete, rename, mkdir, symlink
+	Kind        OverlayKind
 	BackingPath string
 	Mode        uint32
 	SizeBytes   int64
 	MtimeUnixNs int64
 	SourceOID   string
 	TargetPath  string
+}
+
+func (e OverlayEntry) IsDeleted() bool {
+	return e.Kind == OverlayKindDelete
+}
+
+func (e OverlayEntry) NodeType() string {
+	switch e.Kind {
+	case OverlayKindMkdir:
+		return "dir"
+	case OverlayKindSymlink:
+		return "symlink"
+	default:
+		return "file"
+	}
 }
 
 type HydrationTask struct {
@@ -72,14 +98,6 @@ type HydrationTask struct {
 	Priority   int
 	Reason     string
 	EnqueuedAt time.Time
-}
-
-type LearnedPathStats struct {
-	RepoID         RepoID
-	Path           string
-	AccessCount    int64
-	LastAccessNs   int64
-	LastHydratedNs int64
 }
 
 // CleanPath normalizes a filesystem path for use as a map key or DB lookup.
@@ -129,14 +147,13 @@ type GitStore interface {
 }
 
 type SnapshotStore interface {
-	PublishGeneration(ctx context.Context, repoID RepoID, headOID string, ref string, nodes []BaseNode) (generation int64, err error)
-	GetNode(repoID RepoID, generation int64, path string) (BaseNode, bool)
-	ListChildren(repoID RepoID, generation int64, parentPath string) ([]BaseNode, error)
+	PublishGeneration(ctx context.Context, headOID string, ref string, nodes []BaseNode) (generation int64, err error)
+	GetNode(generation int64, path string) (BaseNode, bool)
+	ListChildren(generation int64, parentPath string) ([]BaseNode, error)
 }
 
 type OverlayStore interface {
 	Get(path string) (OverlayEntry, bool)
-	HasWhiteout(path string) bool
 	EnsureCopyOnWrite(ctx context.Context, repo RepoConfig, path string, base BaseNode) (OverlayEntry, error)
 	CreateFile(ctx context.Context, path string, mode uint32) (OverlayEntry, error)
 	WriteFile(ctx context.Context, path string, off int64, data []byte) (int, error)

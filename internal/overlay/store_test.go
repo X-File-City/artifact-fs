@@ -37,7 +37,7 @@ func TestCreateAndGet(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if e.Kind != "create" || e.Path != "hello.txt" {
+	if e.Kind != model.OverlayKindCreate || e.Path != "hello.txt" {
 		t.Fatalf("unexpected entry: %+v", e)
 	}
 
@@ -45,7 +45,7 @@ func TestCreateAndGet(t *testing.T) {
 	if !ok {
 		t.Fatal("expected to find hello.txt")
 	}
-	if got.Kind != "create" || got.BackingPath == "" {
+	if got.Kind != model.OverlayKindCreate || got.BackingPath == "" {
 		t.Fatalf("unexpected: %+v", got)
 	}
 }
@@ -81,7 +81,7 @@ func TestRemoveCreatesWhiteout(t *testing.T) {
 	if err := s.Remove(ctx, "del.txt"); err != nil {
 		t.Fatal(err)
 	}
-	if !s.HasWhiteout("del.txt") {
+	if e, ok := s.Get("del.txt"); !ok || !e.IsDeleted() {
 		t.Fatal("expected whiteout")
 	}
 	if _, ok := s.Get("del.txt"); !ok {
@@ -101,12 +101,12 @@ func TestRenameDBFirst(t *testing.T) {
 	}
 
 	// Old path should have a whiteout
-	if !s.HasWhiteout("old.txt") {
+	if e, ok := s.Get("old.txt"); !ok || !e.IsDeleted() {
 		t.Fatal("expected whiteout at old path")
 	}
 	// New path should exist
 	got, ok := s.Get("new.txt")
-	if !ok || got.Kind != "rename" {
+	if !ok || got.Kind != model.OverlayKindRename {
 		t.Fatalf("expected rename entry, got %+v ok=%v", got, ok)
 	}
 	// File content should be readable at new backing path
@@ -162,7 +162,7 @@ func TestMkdir(t *testing.T) {
 		t.Fatal(err)
 	}
 	e, ok := s.Get("subdir")
-	if !ok || e.Kind != "mkdir" {
+	if !ok || e.Kind != model.OverlayKindMkdir {
 		t.Fatalf("expected mkdir entry, got %+v", e)
 	}
 }
@@ -300,7 +300,7 @@ func TestReconcileKeepsValidEntries(t *testing.T) {
 	if _, ok := s.Get("local-only.txt"); !ok {
 		t.Fatal("local-only.txt should be kept (not in base)")
 	}
-	if !s.HasWhiteout("hidden.txt") {
+	if e, ok := s.Get("hidden.txt"); !ok || !e.IsDeleted() {
 		t.Fatal("hidden.txt whiteout should be kept (still in base)")
 	}
 }

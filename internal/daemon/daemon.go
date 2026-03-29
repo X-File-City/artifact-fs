@@ -53,6 +53,12 @@ type repoRuntime struct {
 	stop     chan struct{}
 }
 
+type aheadBehind struct {
+	ahead    int
+	behind   int
+	diverged bool
+}
+
 func New(ctx context.Context, root string, logger *slog.Logger) (*Service, error) {
 	reg, err := registry.New(ctx, filepath.Join(root, "config", "repos.sqlite"))
 	if err != nil {
@@ -272,11 +278,7 @@ func (s *Service) FetchNow(ctx context.Context, name string) error {
 	}
 	s.mu.Lock()
 	if rt, ok := s.running[cfg.ID]; ok {
-		rt.state.AheadCount = state.AheadCount
-		rt.state.BehindCount = state.BehindCount
-		rt.state.Diverged = state.Diverged
-		rt.state.LastFetchAt = time.Now()
-		rt.state.LastFetchResult = "ok"
+		markFetchSuccess(&rt.state, time.Now(), state)
 	}
 	s.mu.Unlock()
 	return nil
@@ -353,11 +355,7 @@ func (s *Service) mountRepo(ctx context.Context, cfg model.RepoConfig) error {
 	}
 	h := hydrator.New(s.git)
 
-	resolver := &fusefs.Resolver{
-		RepoID:   cfg.ID,
-		Snapshot: snap,
-		Overlay:  ov,
-	}
+	resolver := &fusefs.Resolver{Snapshot: snap, Overlay: ov}
 	resolver.SetGeneration(gen)
 	s.refreshCommitTime(ctx, cfg, headOID, resolver, "commit timestamp unavailable, mtime will use generation fallback")
 
@@ -385,33 +383,10 @@ func (s *Service) mountRepo(ctx context.Context, cfg model.RepoConfig) error {
 		hydrator: h,
 		resolver: resolver,
 		mfs:      mfs,
-		state: model.RepoRuntimeState{
-			RepoID:             cfg.ID,
-			CurrentHEADOID:     headOID,
-			CurrentHEADRef:     headRef,
-			SnapshotGeneration: gen,
-			State:              "ready",
-		},
-		stop: make(chan struct{}),
+		state:    newRuntimeState(cfg.ID, headOID, headRef, gen),
+		stop:     make(chan struct{}),
 	}
-	s.mu.Lock()
-	s.running[cfg.ID] = rt
-	s.mu.Unlock()
-
-	go s.refreshLoop(rt)
-
-	w := watcher.New(500 * time.Millisecond)
-	go w.Watch(ctx, cfg.GitDir, func(sig watcher.Signal) {
-		if sig.HEADChanged {
-			s.onHEADChanged(ctx, rt)
-		}
-	})
-
-	if mfs != nil {
-		go func() {
-			_ = mfs.Join(ctx)
-		}()
-	}
+	s.startRuntime(ctx, rt)
 
 	return nil
 }
@@ -438,7 +413,7 @@ func (s *Service) onHEADChanged(ctx context.Context, rt *repoRuntime) {
 		return
 	}
 	baseLookup := func(path string) (model.BaseNode, bool) {
-		return rt.snapshot.GetNode(rt.cfg.ID, gen, path)
+		return rt.snapshot.GetNode(gen, path)
 	}
 	if err := rt.overlay.Reconcile(ctx, baseLookup); err != nil {
 		s.logger.Warn("overlay reconcile failed", "repo", rt.cfg.Name, "error", err)
@@ -455,9 +430,7 @@ func (s *Service) onHEADChanged(ctx context.Context, rt *repoRuntime) {
 	// Atomically update the resolver's generation so FUSE ops see the new snapshot
 	rt.resolver.SetGeneration(gen)
 	s.mu.Lock()
-	rt.state.CurrentHEADOID = oid
-	rt.state.CurrentHEADRef = ref
-	rt.state.SnapshotGeneration = gen
+	setHeadState(&rt.state, oid, ref, gen)
 	s.mu.Unlock()
 }
 
@@ -475,8 +448,7 @@ func (s *Service) refreshLoop(rt *repoRuntime) {
 			err := s.git.Fetch(ctx, rt.cfg)
 			if err != nil {
 				s.mu.Lock()
-				rt.state.State = "degraded"
-				rt.state.LastFetchResult = auth.RedactString(err.Error())
+				markFetchFailure(&rt.state, auth.RedactString(err.Error()))
 				s.mu.Unlock()
 				cancel()
 				// Exponential backoff on failure, capped at maxBackoff
@@ -493,15 +465,9 @@ func (s *Service) refreshLoop(rt *repoRuntime) {
 			backoff = rt.cfg.RefreshInterval
 			ticker.Reset(backoff)
 			s.mu.Lock()
-			rt.state.LastFetchResult = "ok"
-			rt.state.LastFetchAt = time.Now()
-			if rt.state.State == "degraded" {
-				rt.state.State = "ready"
-			}
+			markFetchResult(&rt.state, time.Now(), "ok")
 			if abErr == nil {
-				rt.state.AheadCount = state.AheadCount
-				rt.state.BehindCount = state.BehindCount
-				rt.state.Diverged = state.Diverged
+				applyAheadBehind(&rt.state, state)
 			}
 			s.mu.Unlock()
 		}
@@ -554,7 +520,7 @@ func (s *Service) publishSnapshot(ctx context.Context, cfg model.RepoConfig, sna
 	if err != nil {
 		return 0, "build", err
 	}
-	gen, err := snap.PublishGeneration(ctx, cfg.ID, oid, ref, nodes)
+	gen, err := snap.PublishGeneration(ctx, oid, ref, nodes)
 	if err != nil {
 		return 0, "publish", err
 	}
@@ -569,12 +535,73 @@ func (s *Service) refreshCommitTime(ctx context.Context, cfg model.RepoConfig, o
 	}
 }
 
-func (s *Service) fetchState(ctx context.Context, cfg model.RepoConfig) (model.RepoRuntimeState, error) {
+func (s *Service) fetchState(ctx context.Context, cfg model.RepoConfig) (aheadBehind, error) {
 	ahead, behind, diverged, err := s.git.ComputeAheadBehind(ctx, cfg)
 	if err != nil {
-		return model.RepoRuntimeState{}, err
+		return aheadBehind{}, err
 	}
-	return model.RepoRuntimeState{AheadCount: ahead, BehindCount: behind, Diverged: diverged}, nil
+	return aheadBehind{ahead: ahead, behind: behind, diverged: diverged}, nil
+}
+
+func (s *Service) startRuntime(ctx context.Context, rt *repoRuntime) {
+	s.mu.Lock()
+	s.running[rt.cfg.ID] = rt
+	s.mu.Unlock()
+
+	go s.refreshLoop(rt)
+
+	w := watcher.New(500 * time.Millisecond)
+	go w.Watch(ctx, rt.cfg.GitDir, func(sig watcher.Signal) {
+		if sig.HEADChanged {
+			s.onHEADChanged(ctx, rt)
+		}
+	})
+
+	if rt.mfs != nil {
+		go func() {
+			_ = rt.mfs.Join(ctx)
+		}()
+	}
+}
+
+func newRuntimeState(repoID model.RepoID, headOID string, headRef string, gen int64) model.RepoRuntimeState {
+	return model.RepoRuntimeState{
+		RepoID:             repoID,
+		CurrentHEADOID:     headOID,
+		CurrentHEADRef:     headRef,
+		SnapshotGeneration: gen,
+		State:              "ready",
+	}
+}
+
+func setHeadState(st *model.RepoRuntimeState, oid string, ref string, gen int64) {
+	st.CurrentHEADOID = oid
+	st.CurrentHEADRef = ref
+	st.SnapshotGeneration = gen
+}
+
+func applyAheadBehind(st *model.RepoRuntimeState, state aheadBehind) {
+	st.AheadCount = state.ahead
+	st.BehindCount = state.behind
+	st.Diverged = state.diverged
+}
+
+func markFetchSuccess(st *model.RepoRuntimeState, at time.Time, state aheadBehind) {
+	markFetchResult(st, at, "ok")
+	applyAheadBehind(st, state)
+}
+
+func markFetchResult(st *model.RepoRuntimeState, at time.Time, result string) {
+	st.LastFetchResult = result
+	st.LastFetchAt = at
+	if st.State == "degraded" && result == "ok" {
+		st.State = "ready"
+	}
+}
+
+func markFetchFailure(st *model.RepoRuntimeState, result string) {
+	st.State = "degraded"
+	st.LastFetchResult = result
 }
 
 func (s *Service) unmount(id model.RepoID) {

@@ -142,7 +142,7 @@ func benchmarkRepo(t *testing.T, git *gitstore.Store, repo repoSpec) []timing {
 	if err != nil {
 		t.Fatalf("snapshot.New: %v", err)
 	}
-	gen, err := snap.PublishGeneration(ctx, cfg.ID, headOID, headRef, nodes)
+	gen, err := snap.PublishGeneration(ctx, headOID, headRef, nodes)
 	if err != nil {
 		t.Fatalf("PublishGeneration: %v", err)
 	}
@@ -160,7 +160,7 @@ func benchmarkRepo(t *testing.T, git *gitstore.Store, repo repoSpec) []timing {
 	// -------------------------------------------------------
 	// Root readdir
 	start = time.Now()
-	rootChildren, err := snap.ListChildren(cfg.ID, gen, ".")
+	rootChildren, err := snap.ListChildren(gen, ".")
 	if err != nil {
 		t.Fatalf("ListChildren root: %v", err)
 	}
@@ -171,7 +171,7 @@ func benchmarkRepo(t *testing.T, git *gitstore.Store, repo repoSpec) []timing {
 	// Getattr for all root children (simulates what FUSE does after readdir)
 	start = time.Now()
 	for _, c := range rootChildren {
-		snap.GetNode(cfg.ID, gen, c.Path)
+		snap.GetNode(gen, c.Path)
 	}
 	rootGetattrDur := time.Since(start)
 	results = append(results, timing{"getattr root children (snapshot)", rootGetattrDur,
@@ -181,7 +181,7 @@ func benchmarkRepo(t *testing.T, git *gitstore.Store, repo repoSpec) []timing {
 	deepDir := findDeepDir(nodes, 3)
 	if deepDir != "" {
 		start = time.Now()
-		deepChildren, _ := snap.ListChildren(cfg.ID, gen, deepDir)
+		deepChildren, _ := snap.ListChildren(gen, deepDir)
 		results = append(results, timing{"readdir deep dir (snapshot)", time.Since(start),
 			fmt.Sprintf("%s -> %d children", deepDir, len(deepChildren))})
 	}
@@ -197,11 +197,7 @@ func benchmarkRepo(t *testing.T, git *gitstore.Store, repo repoSpec) []timing {
 	}
 	defer ov.Close()
 
-	resolver := &fusefs.Resolver{
-		RepoID:   cfg.ID,
-		Snapshot: snap,
-		Overlay:  ov,
-	}
+	resolver := &fusefs.Resolver{Snapshot: snap, Overlay: ov}
 	resolver.SetGeneration(gen)
 
 	// Merged readdir (snapshot + overlay)
@@ -343,7 +339,7 @@ func benchmarkRepo(t *testing.T, git *gitstore.Store, repo repoSpec) []timing {
 		fmt.Sprintf("%d nodes", len(nodes2))})
 
 	start = time.Now()
-	gen2, err := snap.PublishGeneration(ctx, cfg.ID, headOID, headRef, nodes2)
+	gen2, err := snap.PublishGeneration(ctx, headOID, headRef, nodes2)
 	if err != nil {
 		t.Fatalf("re-publish: %v", err)
 	}
