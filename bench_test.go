@@ -230,7 +230,7 @@ func benchmarkRepo(t *testing.T, git *gitstore.Store, repo repoSpec) []timing {
 	var hydrateTotalBytes int64
 	for _, n := range sampleFiles {
 		start = time.Now()
-		_, size, err := h.EnsureHydrated(ctx, cfg, n.Path, n.ObjectOID)
+		_, size, err := h.EnsureHydrated(ctx, cfg, n)
 		dur := time.Since(start)
 		if err != nil {
 			t.Logf("hydrate %s: %v", n.Path, err)
@@ -260,7 +260,7 @@ func benchmarkRepo(t *testing.T, git *gitstore.Store, repo repoSpec) []timing {
 	var warmDurs []time.Duration
 	for _, n := range sampleFiles {
 		start = time.Now()
-		_, _, err := h.EnsureHydrated(ctx, cfg, n.Path, n.ObjectOID)
+		_, _, err := h.EnsureHydrated(ctx, cfg, n)
 		dur := time.Since(start)
 		if err != nil {
 			continue
@@ -299,7 +299,7 @@ func benchmarkRepo(t *testing.T, git *gitstore.Store, repo repoSpec) []timing {
 		for _, n := range freshBatch {
 			n := n
 			go func() {
-				_, size, err := h.EnsureHydrated(ctx, cfg, n.Path, n.ObjectOID)
+				_, size, err := h.EnsureHydrated(ctx, cfg, n)
 				results_ch <- hydrateResult{size, err}
 			}()
 		}

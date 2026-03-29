@@ -58,14 +58,16 @@ func New(ctx context.Context, root string, logger *slog.Logger) (*Service, error
 	if err != nil {
 		return nil, err
 	}
-	return &Service{
+	svc := &Service{
 		root:          root,
 		logger:        logger,
 		registry:      reg,
 		git:           gitstore.New(logger),
 		running:       map[model.RepoID]*repoRuntime{},
 		mountFailures: map[model.RepoID]*mountFailure{},
-	}, nil
+	}
+	svc.git.SetBatchPoolSize(DefaultHydrationConcurrency)
+	return svc, nil
 }
 
 func (s *Service) SetMountRoot(root string) {
@@ -77,6 +79,7 @@ func (s *Service) SetMountRoot(root string) {
 func (s *Service) SetHydrationConcurrency(n int) {
 	if n > 0 {
 		s.hydrationConcurrency = n
+		s.git.SetBatchPoolSize(n)
 	}
 }
 
@@ -252,41 +255,7 @@ func (s *Service) Status(ctx context.Context, name string) (model.RepoRuntimeSta
 		return st, nil
 	}
 	s.mu.Unlock()
-
-	// One-shot CLI process: reconstruct state from persisted stores and
-	// OS-level mount check since we don't share memory with the daemon.
-	st := model.RepoRuntimeState{RepoID: cfg.ID, State: "unmounted"}
-
-	if isMounted(cfg.MountPath) {
-		st.State = "mounted"
-	}
-
-	if cfg.MetaDBPath != "" {
-		if snap, err := snapshot.New(ctx, cfg.MetaDBPath); err == nil {
-			st.CurrentHEADOID, st.CurrentHEADRef, st.SnapshotGeneration, _ = snap.ReadState(ctx)
-			snap.Close()
-		}
-	}
-
-	if cfg.OverlayDBPath != "" {
-		if _, statErr := os.Stat(cfg.OverlayDBPath); statErr == nil {
-			if db, err := meta.OpenDB(cfg.OverlayDBPath); err == nil {
-				var count int64
-				if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM overlay_entries WHERE kind <> 'delete'`).Scan(&count); err == nil {
-					st.DirtyOverlay = count > 0
-				}
-				db.Close()
-			}
-		}
-	}
-
-	// Best-effort last fetch time from FETCH_HEAD mtime.
-	if fi, err := os.Stat(filepath.Join(cfg.GitDir, "FETCH_HEAD")); err == nil {
-		st.LastFetchAt = fi.ModTime()
-		st.LastFetchResult = "ok"
-	}
-
-	return st, nil
+	return s.readPersistedStatus(ctx, cfg), nil
 }
 
 func (s *Service) FetchNow(ctx context.Context, name string) error {
@@ -297,15 +266,15 @@ func (s *Service) FetchNow(ctx context.Context, name string) error {
 	if err := s.git.Fetch(ctx, cfg); err != nil {
 		return err
 	}
-	ahead, behind, diverged, err := s.git.ComputeAheadBehind(ctx, cfg)
+	state, err := s.fetchState(ctx, cfg)
 	if err != nil {
 		return err
 	}
 	s.mu.Lock()
 	if rt, ok := s.running[cfg.ID]; ok {
-		rt.state.AheadCount = ahead
-		rt.state.BehindCount = behind
-		rt.state.Diverged = diverged
+		rt.state.AheadCount = state.AheadCount
+		rt.state.BehindCount = state.BehindCount
+		rt.state.Diverged = state.Diverged
 		rt.state.LastFetchAt = time.Now()
 		rt.state.LastFetchResult = "ok"
 	}
@@ -341,20 +310,12 @@ func (s *Service) prepareRepo(ctx context.Context, cfg model.RepoConfig) error {
 	if err := s.git.CloneBlobless(ctx, cfg); err != nil {
 		return err
 	}
-	headOID, headRef, err := s.git.ResolveHEAD(ctx, cfg)
-	if err != nil {
-		return err
-	}
-	nodes, err := s.git.BuildTreeIndex(ctx, cfg, headOID)
-	if err != nil {
-		return err
-	}
 	snap, err := snapshot.New(ctx, cfg.MetaDBPath)
 	if err != nil {
 		return err
 	}
 	defer snap.Close()
-	_, err = snap.PublishGeneration(ctx, cfg.ID, headOID, headRef, nodes)
+	_, err = s.publishHeadSnapshot(ctx, cfg, snap)
 	return err
 }
 
@@ -378,15 +339,11 @@ func (s *Service) mountRepo(ctx context.Context, cfg model.RepoConfig) error {
 	}
 	gen, err := snap.CurrentGeneration(ctx)
 	if err != nil || gen == 0 {
-		nodes, bErr := s.git.BuildTreeIndex(ctx, cfg, headOID)
+		var bErr error
+		gen, _, bErr = s.publishSnapshot(ctx, cfg, snap, headOID, headRef)
 		if bErr != nil {
 			snap.Close()
 			return bErr
-		}
-		gen, err = snap.PublishGeneration(ctx, cfg.ID, headOID, headRef, nodes)
-		if err != nil {
-			snap.Close()
-			return err
 		}
 	}
 	ov, err := overlay.New(ctx, cfg)
@@ -402,11 +359,7 @@ func (s *Service) mountRepo(ctx context.Context, cfg model.RepoConfig) error {
 		Overlay:  ov,
 	}
 	resolver.SetGeneration(gen)
-	if ts, err := s.git.CommitTimestamp(ctx, cfg, headOID); err == nil {
-		resolver.SetCommitTime(ts)
-	} else {
-		s.logger.Warn("commit timestamp unavailable, mtime will use generation fallback", "repo", cfg.Name, "error", err)
-	}
+	s.refreshCommitTime(ctx, cfg, headOID, resolver, "commit timestamp unavailable, mtime will use generation fallback")
 
 	h.SetOnHydrated(func(_ model.RepoID, objectOID string, size int64) {
 		snap.UpdateSize(resolver.Generation(), objectOID, size)
@@ -475,14 +428,13 @@ func (s *Service) onHEADChanged(ctx context.Context, rt *repoRuntime) {
 	if oid == prevOID {
 		return
 	}
-	nodes, err := s.git.BuildTreeIndex(ctx, rt.cfg, oid)
+	gen, phase, err := s.publishSnapshot(ctx, rt.cfg, rt.snapshot, oid, ref)
 	if err != nil {
-		s.logger.Error("tree rebuild failed", "repo", rt.cfg.Name, "error", err)
-		return
-	}
-	gen, err := rt.snapshot.PublishGeneration(ctx, rt.cfg.ID, oid, ref, nodes)
-	if err != nil {
-		s.logger.Error("snapshot publish failed", "repo", rt.cfg.Name, "error", err)
+		msg := "tree rebuild failed"
+		if phase == "publish" {
+			msg = "snapshot publish failed"
+		}
+		s.logger.Error(msg, "repo", rt.cfg.Name, "error", err)
 		return
 	}
 	baseLookup := func(path string) (model.BaseNode, bool) {
@@ -498,12 +450,7 @@ func (s *Service) onHEADChanged(ctx context.Context, rt *repoRuntime) {
 	if err := s.git.ReadTreeHEAD(ctx, rt.cfg); err != nil {
 		s.logger.Warn("read-tree HEAD failed", "repo", rt.cfg.Name, "error", err)
 	}
-
-	if ts, err := s.git.CommitTimestamp(ctx, rt.cfg, oid); err == nil {
-		rt.resolver.SetCommitTime(ts)
-	} else {
-		s.logger.Warn("commit timestamp unavailable", "repo", rt.cfg.Name, "error", err)
-	}
+	s.refreshCommitTime(ctx, rt.cfg, oid, rt.resolver, "commit timestamp unavailable")
 
 	// Atomically update the resolver's generation so FUSE ops see the new snapshot
 	rt.resolver.SetGeneration(gen)
@@ -540,7 +487,7 @@ func (s *Service) refreshLoop(rt *repoRuntime) {
 				ticker.Reset(backoff)
 				continue
 			}
-			ahead, behind, diverged, abErr := s.git.ComputeAheadBehind(ctx, rt.cfg)
+			state, abErr := s.fetchState(ctx, rt.cfg)
 			cancel()
 			// Reset backoff on success
 			backoff = rt.cfg.RefreshInterval
@@ -552,13 +499,82 @@ func (s *Service) refreshLoop(rt *repoRuntime) {
 				rt.state.State = "ready"
 			}
 			if abErr == nil {
-				rt.state.AheadCount = ahead
-				rt.state.BehindCount = behind
-				rt.state.Diverged = diverged
+				rt.state.AheadCount = state.AheadCount
+				rt.state.BehindCount = state.BehindCount
+				rt.state.Diverged = state.Diverged
 			}
 			s.mu.Unlock()
 		}
 	}
+}
+
+func (s *Service) readPersistedStatus(ctx context.Context, cfg model.RepoConfig) model.RepoRuntimeState {
+	// One-shot CLI process: reconstruct state from persisted stores and
+	// OS-level mount check since we don't share memory with the daemon.
+	st := model.RepoRuntimeState{RepoID: cfg.ID, State: "unmounted"}
+	if isMounted(cfg.MountPath) {
+		st.State = "mounted"
+	}
+	if cfg.MetaDBPath != "" {
+		if snap, err := snapshot.New(ctx, cfg.MetaDBPath); err == nil {
+			st.CurrentHEADOID, st.CurrentHEADRef, st.SnapshotGeneration, _ = snap.ReadState(ctx)
+			snap.Close()
+		}
+	}
+	if cfg.OverlayDBPath != "" {
+		if _, statErr := os.Stat(cfg.OverlayDBPath); statErr == nil {
+			if db, err := meta.OpenDB(cfg.OverlayDBPath); err == nil {
+				var count int64
+				if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM overlay_entries WHERE kind <> 'delete'`).Scan(&count); err == nil {
+					st.DirtyOverlay = count > 0
+				}
+				db.Close()
+			}
+		}
+	}
+	// Best-effort last fetch time from FETCH_HEAD mtime.
+	if fi, err := os.Stat(filepath.Join(cfg.GitDir, "FETCH_HEAD")); err == nil {
+		st.LastFetchAt = fi.ModTime()
+		st.LastFetchResult = "ok"
+	}
+	return st
+}
+
+func (s *Service) publishHeadSnapshot(ctx context.Context, cfg model.RepoConfig, snap *snapshot.Store) (int64, error) {
+	oid, ref, err := s.git.ResolveHEAD(ctx, cfg)
+	if err != nil {
+		return 0, err
+	}
+	gen, _, err := s.publishSnapshot(ctx, cfg, snap, oid, ref)
+	return gen, err
+}
+
+func (s *Service) publishSnapshot(ctx context.Context, cfg model.RepoConfig, snap *snapshot.Store, oid string, ref string) (int64, string, error) {
+	nodes, err := s.git.BuildTreeIndex(ctx, cfg, oid)
+	if err != nil {
+		return 0, "build", err
+	}
+	gen, err := snap.PublishGeneration(ctx, cfg.ID, oid, ref, nodes)
+	if err != nil {
+		return 0, "publish", err
+	}
+	return gen, "", nil
+}
+
+func (s *Service) refreshCommitTime(ctx context.Context, cfg model.RepoConfig, oid string, resolver *fusefs.Resolver, warnMsg string) {
+	if ts, err := s.git.CommitTimestamp(ctx, cfg, oid); err == nil {
+		resolver.SetCommitTime(ts)
+	} else {
+		s.logger.Warn(warnMsg, "repo", cfg.Name, "error", err)
+	}
+}
+
+func (s *Service) fetchState(ctx context.Context, cfg model.RepoConfig) (model.RepoRuntimeState, error) {
+	ahead, behind, diverged, err := s.git.ComputeAheadBehind(ctx, cfg)
+	if err != nil {
+		return model.RepoRuntimeState{}, err
+	}
+	return model.RepoRuntimeState{AheadCount: ahead, BehindCount: behind, Diverged: diverged}, nil
 }
 
 func (s *Service) unmount(id model.RepoID) {

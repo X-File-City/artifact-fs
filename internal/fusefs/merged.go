@@ -86,12 +86,7 @@ func (r *Resolver) Getattr(path string) (mode uint32, size int64, nodeType strin
 		return 0, 0, "", time.Time{}, err
 	}
 	if n.FromOverlay {
-		typ := "file"
-		if n.Overlay.Kind == "mkdir" {
-			typ = "dir"
-		} else if n.Overlay.Kind == "symlink" {
-			typ = "symlink"
-		}
+		typ := overlayNodeType(n.Overlay.Kind)
 		mt := time.Unix(0, n.Overlay.MtimeUnixNs)
 		return n.Overlay.Mode, n.Overlay.SizeBytes, typ, mt, nil
 	}
@@ -157,19 +152,15 @@ func (r *Resolver) ReaddirTyped(ctx context.Context, path string) ([]ReaddirEntr
 			if !ok {
 				continue
 			}
-			if e.Kind == "delete" && e.Path == model.CleanPath(filepath.Join(path, name)) {
+			childPath := model.CleanPath(filepath.Join(path, name))
+			if e.Kind == "delete" && e.Path == childPath {
 				delete(set, name)
 				continue
 			}
-			if r.Overlay.HasWhiteout(model.CleanPath(filepath.Join(path, name))) {
+			if r.Overlay.HasWhiteout(childPath) {
 				continue
 			}
-			typ := "file"
-			if e.Kind == "mkdir" {
-				typ = "dir"
-			} else if e.Kind == "symlink" {
-				typ = "symlink"
-			}
+			typ := overlayNodeType(e.Kind)
 			set[name] = entry{name: name, typ: typ}
 		}
 	}
@@ -179,4 +170,15 @@ func (r *Resolver) ReaddirTyped(ctx context.Context, path string) ([]ReaddirEntr
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out, nil
+}
+
+func overlayNodeType(kind string) string {
+	switch kind {
+	case "mkdir":
+		return "dir"
+	case "symlink":
+		return "symlink"
+	default:
+		return "file"
+	}
 }

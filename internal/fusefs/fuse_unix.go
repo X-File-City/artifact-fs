@@ -133,7 +133,7 @@ func (fs *ArtifactFuse) LookUpInode(_ context.Context, op *fuseops.LookUpInodeOp
 		return syscall.ENOENT
 	}
 
-	childPath := model.CleanPath(filepath.Join(parent.Path, op.Name))
+	childPath := cleanChildPath(parent.Path, op.Name)
 
 	// Synthesize .git gitfile in root
 	if parent.IsRoot && op.Name == ".git" {
@@ -141,16 +141,8 @@ func (fs *ArtifactFuse) LookUpInode(_ context.Context, op *fuseops.LookUpInodeOp
 		ref := fs.allocInode(".git", "file", 0o644)
 		fs.mu.Unlock()
 		op.Entry.Child = ref.ID
-		op.Entry.Attributes = fuseops.InodeAttributes{
-			Size:  uint64(len(fs.gitfileContent)),
-			Mode:  0o644,
-			Nlink: 1,
-			Uid:   uint32(os.Getuid()),
-			Gid:   uint32(os.Getgid()),
-			Mtime: time.Now(),
-		}
-		op.Entry.AttributesExpiration = time.Now().Add(time.Minute)
-		op.Entry.EntryExpiration = time.Now().Add(time.Minute)
+		op.Entry.Attributes = fs.gitFileAttrs()
+		setChildEntryExpiry(&op.Entry, time.Minute)
 		return nil
 	}
 
@@ -168,8 +160,7 @@ func (fs *ArtifactFuse) LookUpInode(_ context.Context, op *fuseops.LookUpInodeOp
 
 	op.Entry.Child = ref.ID
 	op.Entry.Attributes = inodeAttrs(mode, uint64(size), typ, mtime)
-	op.Entry.AttributesExpiration = time.Now().Add(time.Second)
-	op.Entry.EntryExpiration = time.Now().Add(time.Second)
+	setChildEntryExpiry(&op.Entry, time.Second)
 	return nil
 }
 
@@ -180,12 +171,8 @@ func (fs *ArtifactFuse) GetInodeAttributes(_ context.Context, op *fuseops.GetIno
 	}
 
 	if ref.Path == ".git" {
-		op.Attributes = fuseops.InodeAttributes{
-			Size: uint64(len(fs.gitfileContent)), Mode: 0o644, Nlink: 1,
-			Uid: uint32(os.Getuid()), Gid: uint32(os.Getgid()),
-			Mtime: time.Now(),
-		}
-		op.AttributesExpiration = time.Now().Add(time.Minute)
+		op.Attributes = fs.gitFileAttrs()
+		op.AttributesExpiration = attrExpiry(time.Minute)
 		return nil
 	}
 
@@ -194,7 +181,7 @@ func (fs *ArtifactFuse) GetInodeAttributes(_ context.Context, op *fuseops.GetIno
 		return syscall.ENOENT
 	}
 	op.Attributes = inodeAttrs(mode, uint64(size), typ, mtime)
-	op.AttributesExpiration = time.Now().Add(time.Second)
+	op.AttributesExpiration = attrExpiry(time.Second)
 	return nil
 }
 
@@ -221,7 +208,7 @@ func (fs *ArtifactFuse) SetInodeAttributes(ctx context.Context, op *fuseops.SetI
 		mtime = *op.Mtime
 	}
 	op.Attributes = inodeAttrs(mode, uint64(size), typ, mtime)
-	op.AttributesExpiration = time.Now().Add(time.Second)
+	op.AttributesExpiration = attrExpiry(time.Second)
 	return nil
 }
 
@@ -377,7 +364,7 @@ func (fs *ArtifactFuse) CreateFile(ctx context.Context, op *fuseops.CreateFileOp
 	if parent == nil {
 		return syscall.ENOENT
 	}
-	childPath := model.CleanPath(filepath.Join(parent.Path, op.Name))
+	childPath := cleanChildPath(parent.Path, op.Name)
 	if err := fs.engine.Create(ctx, childPath, uint32(op.Mode)); err != nil {
 		return syscall.EIO
 	}
@@ -391,8 +378,7 @@ func (fs *ArtifactFuse) CreateFile(ctx context.Context, op *fuseops.CreateFileOp
 
 	op.Entry.Child = ref.ID
 	op.Entry.Attributes = inodeAttrs(uint32(op.Mode), 0, "file", time.Now())
-	op.Entry.AttributesExpiration = time.Now().Add(time.Second)
-	op.Entry.EntryExpiration = time.Now().Add(time.Second)
+	setChildEntryExpiry(&op.Entry, time.Second)
 	op.Handle = handle
 	return nil
 }
@@ -402,7 +388,7 @@ func (fs *ArtifactFuse) MkDir(ctx context.Context, op *fuseops.MkDirOp) error {
 	if parent == nil {
 		return syscall.ENOENT
 	}
-	childPath := model.CleanPath(filepath.Join(parent.Path, op.Name))
+	childPath := cleanChildPath(parent.Path, op.Name)
 	if err := fs.engine.Mkdir(ctx, childPath, uint32(op.Mode)); err != nil {
 		return syscall.EIO
 	}
@@ -412,8 +398,7 @@ func (fs *ArtifactFuse) MkDir(ctx context.Context, op *fuseops.MkDirOp) error {
 
 	op.Entry.Child = ref.ID
 	op.Entry.Attributes = inodeAttrs(uint32(op.Mode)|uint32(os.ModeDir), 4096, "dir", time.Now())
-	op.Entry.AttributesExpiration = time.Now().Add(time.Second)
-	op.Entry.EntryExpiration = time.Now().Add(time.Second)
+	setChildEntryExpiry(&op.Entry, time.Second)
 	return nil
 }
 
@@ -422,7 +407,7 @@ func (fs *ArtifactFuse) RmDir(ctx context.Context, op *fuseops.RmDirOp) error {
 	if parent == nil {
 		return syscall.ENOENT
 	}
-	childPath := model.CleanPath(filepath.Join(parent.Path, op.Name))
+	childPath := cleanChildPath(parent.Path, op.Name)
 	if err := fs.engine.Rmdir(ctx, childPath); err != nil {
 		if os.IsExist(err) {
 			return syscall.ENOTEMPTY
@@ -437,7 +422,7 @@ func (fs *ArtifactFuse) Unlink(ctx context.Context, op *fuseops.UnlinkOp) error 
 	if parent == nil {
 		return syscall.ENOENT
 	}
-	childPath := model.CleanPath(filepath.Join(parent.Path, op.Name))
+	childPath := cleanChildPath(parent.Path, op.Name)
 	if err := fs.engine.Unlink(ctx, childPath); err != nil {
 		return syscall.EIO
 	}
@@ -450,8 +435,8 @@ func (fs *ArtifactFuse) Rename(ctx context.Context, op *fuseops.RenameOp) error 
 	if oldParent == nil || newParent == nil {
 		return syscall.ENOENT
 	}
-	oldPath := model.CleanPath(filepath.Join(oldParent.Path, op.OldName))
-	newPath := model.CleanPath(filepath.Join(newParent.Path, op.NewName))
+	oldPath := cleanChildPath(oldParent.Path, op.OldName)
+	newPath := cleanChildPath(newParent.Path, op.NewName)
 	if err := fs.engine.Rename(ctx, oldPath, newPath); err != nil {
 		return syscall.EIO
 	}
@@ -468,7 +453,7 @@ func (fs *ArtifactFuse) ReadSymlink(ctx context.Context, op *fuseops.ReadSymlink
 		return syscall.ENOENT
 	}
 	if n.Base.ObjectOID != "" {
-		cachePath, _, err := fs.engine.Hydrator.EnsureHydrated(ctx, fs.repo, ref.Path, n.Base.ObjectOID)
+		cachePath, _, err := fs.engine.Hydrator.EnsureHydrated(ctx, fs.repo, n.Base)
 		if err != nil {
 			return syscall.EIO
 		}
@@ -581,5 +566,30 @@ func inodeAttrs(mode uint32, size uint64, typ string, mtime time.Time) fuseops.I
 		Uid:   uint32(os.Getuid()),
 		Gid:   uint32(os.Getgid()),
 		Mtime: mtime,
+	}
+}
+
+func cleanChildPath(parentPath string, name string) string {
+	return model.CleanPath(filepath.Join(parentPath, name))
+}
+
+func attrExpiry(ttl time.Duration) time.Time {
+	return time.Now().Add(ttl)
+}
+
+func setChildEntryExpiry(entry *fuseops.ChildInodeEntry, ttl time.Duration) {
+	expiresAt := attrExpiry(ttl)
+	entry.AttributesExpiration = expiresAt
+	entry.EntryExpiration = expiresAt
+}
+
+func (fs *ArtifactFuse) gitFileAttrs() fuseops.InodeAttributes {
+	return fuseops.InodeAttributes{
+		Size:  uint64(len(fs.gitfileContent)),
+		Mode:  0o644,
+		Nlink: 1,
+		Uid:   uint32(os.Getuid()),
+		Gid:   uint32(os.Getgid()),
+		Mtime: time.Now(),
 	}
 }

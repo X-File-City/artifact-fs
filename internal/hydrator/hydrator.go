@@ -15,6 +15,7 @@ import (
 
 type BlobFetcher interface {
 	BlobToCache(ctx context.Context, repo model.RepoConfig, objectOID string, dstPath string) (size int64, err error)
+	VerifyBlob(ctx context.Context, repo model.RepoConfig, objectOID string, cachePath string) (ok bool, err error)
 }
 
 // OnHydratedFunc is called after a blob is successfully fetched. Allows the
@@ -26,11 +27,13 @@ type Service struct {
 	mu         sync.Mutex
 	pq         priorityQueue
 	wait       map[string][]chan result
+	verifying  map[string][]chan verifyResult
 	started    bool
 	stopOnce   sync.Once
 	stopCh     chan struct{}
 	workReady  chan struct{} // signaled when new work is enqueued
 	onHydrated OnHydratedFunc
+	verified   map[string]struct{}
 }
 
 type result struct {
@@ -39,12 +42,19 @@ type result struct {
 	err       error
 }
 
+type verifyResult struct {
+	ok  bool
+	err error
+}
+
 func New(fetcher BlobFetcher) *Service {
 	return &Service{
 		fetcher:   fetcher,
 		wait:      map[string][]chan result{},
+		verifying: map[string][]chan verifyResult{},
 		stopCh:    make(chan struct{}),
 		workReady: make(chan struct{}, 1),
+		verified:  map[string]struct{}{},
 	}
 }
 
@@ -82,13 +92,7 @@ func (s *Service) Stop() {
 		// Drain pending waiters so they don't block forever
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		for key, chans := range s.wait {
-			for _, ch := range chans {
-				ch <- result{err: errors.New("hydrator stopped")}
-				close(ch)
-			}
-			delete(s.wait, key)
-		}
+		s.stopWaitersLocked(errors.New("hydrator stopped"))
 	})
 }
 
@@ -99,21 +103,16 @@ func (s *Service) Enqueue(task model.HydrationTask) {
 	s.signalWork()
 }
 
-func (s *Service) EnsureHydrated(ctx context.Context, repo model.RepoConfig, path string, oid string) (cachePath string, size int64, err error) {
-	cachePath = filepath.Join(repo.BlobCacheDir, oid)
-	if st, err := os.Stat(cachePath); err == nil {
-		return cachePath, st.Size(), nil
+func (s *Service) EnsureHydrated(ctx context.Context, repo model.RepoConfig, node model.BaseNode) (cachePath string, size int64, err error) {
+	cachePath = cachePathFor(repo, node.ObjectOID)
+	if size, ok, err := s.validateCachedBlob(ctx, repo, cachePath, node); err != nil {
+		return "", 0, err
+	} else if ok {
+		return cachePath, size, nil
 	}
-	key := string(repo.ID) + ":" + oid
+	key := taskKey(repo.ID, node.ObjectOID)
 	ch := make(chan result, 1)
-
-	s.mu.Lock()
-	s.wait[key] = append(s.wait[key], ch)
-	first := len(s.wait[key]) == 1
-	if first {
-		heap.Push(&s.pq, &taskItem{task: model.HydrationTask{RepoID: repo.ID, Path: path, ObjectOID: oid, Priority: PriorityExplicitRead, Reason: "explicit read", EnqueuedAt: time.Now()}})
-	}
-	s.mu.Unlock()
+	first := s.registerWaiter(key, ch, explicitReadTask(repo.ID, node.Path, node.ObjectOID))
 	if first {
 		s.signalWork()
 	}
@@ -122,19 +121,147 @@ func (s *Service) EnsureHydrated(ctx context.Context, repo model.RepoConfig, pat
 	case <-ctx.Done():
 		// Remove our channel from the wait list so the worker doesn't
 		// send to an abandoned channel that nobody reads.
-		s.mu.Lock()
-		if chans, ok := s.wait[key]; ok {
-			for i, c := range chans {
-				if c == ch {
-					s.wait[key] = append(chans[:i], chans[i+1:]...)
-					break
-				}
-			}
-		}
-		s.mu.Unlock()
+		s.removeWaiter(key, ch)
 		return "", 0, ctx.Err()
 	case r := <-ch:
 		return r.cachePath, r.size, r.err
+	}
+}
+
+func (s *Service) validateCachedBlob(ctx context.Context, repo model.RepoConfig, cachePath string, node model.BaseNode) (size int64, ok bool, err error) {
+	st, err := os.Stat(cachePath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	if node.SizeState == "known" && st.Size() != node.SizeBytes {
+		if err := s.removeInvalidCacheFile(cachePath, repo.ID, node.ObjectOID); err != nil {
+			return 0, false, err
+		}
+		return 0, false, nil
+	}
+	key := taskKey(repo.ID, node.ObjectOID)
+	if s.isVerified(key) {
+		return st.Size(), true, nil
+	}
+	ok, err = s.verifyBlobOnce(ctx, key, func(verifyCtx context.Context) (bool, error) {
+		return s.fetcher.VerifyBlob(verifyCtx, repo, node.ObjectOID, cachePath)
+	})
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return 0, false, err
+		}
+		return 0, false, nil
+	}
+	if !ok {
+		if err := s.removeInvalidCacheFile(cachePath, repo.ID, node.ObjectOID); err != nil {
+			return 0, false, err
+		}
+		return 0, false, nil
+	}
+	return st.Size(), true, nil
+}
+
+func (s *Service) isVerified(key string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.verified[key]
+	return ok
+}
+
+func (s *Service) markVerified(key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.verified[key] = struct{}{}
+}
+
+func (s *Service) clearVerified(key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.verified, key)
+}
+
+func (s *Service) removeInvalidCacheFile(cachePath string, repoID model.RepoID, objectOID string) error {
+	if err := os.Remove(cachePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	s.clearVerified(taskKey(repoID, objectOID))
+	return nil
+}
+
+func (s *Service) verifyBlobOnce(ctx context.Context, key string, verify func(context.Context) (bool, error)) (bool, error) {
+	s.mu.Lock()
+	if _, ok := s.verified[key]; ok {
+		s.mu.Unlock()
+		return true, nil
+	}
+	ch := make(chan verifyResult, 1)
+	if waiters, ok := s.verifying[key]; ok {
+		s.verifying[key] = append(waiters, ch)
+		s.mu.Unlock()
+		return s.awaitVerification(ctx, key, ch)
+	}
+	s.verifying[key] = []chan verifyResult{ch}
+	s.mu.Unlock()
+
+	go s.runVerification(key, verify)
+	return s.awaitVerification(ctx, key, ch)
+}
+
+func (s *Service) awaitVerification(ctx context.Context, key string, ch chan verifyResult) (bool, error) {
+	select {
+	case <-ctx.Done():
+		s.removeVerificationWaiter(key, ch)
+		return false, ctx.Err()
+	case r := <-ch:
+		return r.ok, r.err
+	}
+}
+
+func (s *Service) runVerification(key string, verify func(context.Context) (bool, error)) {
+	verifyCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		select {
+		case <-s.stopCh:
+			cancel()
+		case <-verifyCtx.Done():
+		}
+	}()
+
+	ok, err := verify(verifyCtx)
+	r := verifyResult{ok: ok, err: err}
+
+	s.mu.Lock()
+	if err == nil && ok {
+		s.verified[key] = struct{}{}
+	}
+	waiters := s.verifying[key]
+	delete(s.verifying, key)
+	s.mu.Unlock()
+
+	for _, ch := range waiters {
+		ch <- r
+		close(ch)
+	}
+}
+
+func (s *Service) removeVerificationWaiter(key string, ch chan verifyResult) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	waiters, ok := s.verifying[key]
+	if !ok {
+		return
+	}
+	for i, waiter := range waiters {
+		if waiter != ch {
+			continue
+		}
+		waiters = append(waiters[:i], waiters[i+1:]...)
+		s.verifying[key] = waiters
+		return
 	}
 }
 
@@ -178,12 +305,11 @@ func (s *Service) step(repo model.RepoConfig) bool {
 		return false
 	}
 	item := heap.Pop(&s.pq).(*taskItem)
-	key := string(item.task.RepoID) + ":" + item.task.ObjectOID
-	waits := s.wait[key]
-	delete(s.wait, key)
+	key := taskKey(item.task.RepoID, item.task.ObjectOID)
+	waits := s.takeWaitersLocked(key)
 	s.mu.Unlock()
 
-	cachePath := filepath.Join(repo.BlobCacheDir, item.task.ObjectOID)
+	cachePath := cachePathFor(repo, item.task.ObjectOID)
 	if err := os.MkdirAll(filepath.Dir(cachePath), 0o755); err != nil {
 		s.notify(waits, result{err: err})
 		return true
@@ -204,6 +330,7 @@ func (s *Service) step(repo model.RepoConfig) bool {
 		s.notify(waits, result{err: fmt.Errorf("hydrate %s: %w", item.task.Path, err)})
 		return true
 	}
+	s.markVerified(taskKey(item.task.RepoID, item.task.ObjectOID))
 	s.notify(waits, result{cachePath: cachePath, size: size, err: nil})
 	s.mu.Lock()
 	fn := s.onHydrated
@@ -218,6 +345,73 @@ func (s *Service) notify(chans []chan result, r result) {
 	for _, ch := range chans {
 		ch <- r
 		close(ch)
+	}
+}
+
+func taskKey(repoID model.RepoID, oid string) string {
+	return string(repoID) + ":" + oid
+}
+
+func cachePathFor(repo model.RepoConfig, oid string) string {
+	return filepath.Join(repo.BlobCacheDir, oid)
+}
+
+func explicitReadTask(repoID model.RepoID, path string, oid string) model.HydrationTask {
+	return model.HydrationTask{
+		RepoID:     repoID,
+		Path:       path,
+		ObjectOID:  oid,
+		Priority:   PriorityExplicitRead,
+		Reason:     "explicit read",
+		EnqueuedAt: time.Now(),
+	}
+}
+
+func (s *Service) registerWaiter(key string, ch chan result, task model.HydrationTask) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.wait[key] = append(s.wait[key], ch)
+	first := len(s.wait[key]) == 1
+	if first {
+		heap.Push(&s.pq, &taskItem{task: task})
+	}
+	return first
+}
+
+func (s *Service) removeWaiter(key string, ch chan result) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	chans, ok := s.wait[key]
+	if !ok {
+		return
+	}
+	for i, waiter := range chans {
+		if waiter != ch {
+			continue
+		}
+		chans = append(chans[:i], chans[i+1:]...)
+		if len(chans) == 0 {
+			delete(s.wait, key)
+		} else {
+			s.wait[key] = chans
+		}
+		return
+	}
+}
+
+func (s *Service) takeWaitersLocked(key string) []chan result {
+	waits := s.wait[key]
+	delete(s.wait, key)
+	return waits
+}
+
+func (s *Service) stopWaitersLocked(err error) {
+	for key, chans := range s.wait {
+		for _, ch := range chans {
+			ch <- result{err: err}
+			close(ch)
+		}
+		delete(s.wait, key)
 	}
 }
 

@@ -151,6 +151,6 @@ type OverlayStore interface {
 
 type Hydrator interface {
 	Enqueue(task HydrationTask)
-	EnsureHydrated(ctx context.Context, repo RepoConfig, path string, oid string) (cachePath string, size int64, err error)
+	EnsureHydrated(ctx context.Context, repo RepoConfig, node BaseNode) (cachePath string, size int64, err error)
 	QueueDepth(repoID RepoID) int
 }

@@ -46,6 +46,10 @@ type Store struct {
 	db *sql.DB
 }
 
+type stateQueryer interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
 func New(ctx context.Context, path string) (*Store, error) {
 	db, err := meta.OpenDB(path)
 	if err != nil {
@@ -104,17 +108,14 @@ func (s *Store) PublishGeneration(ctx context.Context, repoID model.RepoID, head
 }
 
 func (s *Store) CurrentGeneration(ctx context.Context) (int64, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT value FROM repo_state WHERE key='current_generation'`)
-	var val string
-	if err := row.Scan(&val); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return 0, nil
-		}
+	gen, ok, err := stateInt64(ctx, s.db, "current_generation")
+	if err != nil {
 		return 0, err
 	}
-	var gen int64
-	_, err := fmt.Sscanf(val, "%d", &gen)
-	return gen, err
+	if !ok {
+		return 0, nil
+	}
+	return gen, nil
 }
 
 // ReadState returns persisted HEAD OID, ref, and generation from the snapshot
@@ -124,10 +125,8 @@ func (s *Store) ReadState(ctx context.Context) (headOID, headRef string, generat
 	if err != nil {
 		return "", "", 0, err
 	}
-	row := s.db.QueryRowContext(ctx, `SELECT value FROM repo_state WHERE key='head_oid'`)
-	_ = row.Scan(&headOID)
-	row = s.db.QueryRowContext(ctx, `SELECT value FROM repo_state WHERE key='head_ref'`)
-	_ = row.Scan(&headRef)
+	headOID, _, _ = stateValue(ctx, s.db, "head_oid")
+	headRef, _, _ = stateValue(ctx, s.db, "head_ref")
 	return headOID, headRef, gen, nil
 }
 
@@ -174,19 +173,38 @@ func (s *Store) UpdateSize(generation int64, objectOID string, size int64) {
 }
 
 func (s *Store) nextGenerationTx(ctx context.Context, tx *sql.Tx) (int64, error) {
-	row := tx.QueryRowContext(ctx, `SELECT value FROM repo_state WHERE key='current_generation'`)
+	gen, ok, err := stateInt64(ctx, tx, "current_generation")
+	if err != nil {
+		return 0, err
+	}
+	if !ok {
+		return 1, nil
+	}
+	return gen + 1, nil
+}
+
+func stateValue(ctx context.Context, q stateQueryer, key string) (string, bool, error) {
+	row := q.QueryRowContext(ctx, `SELECT value FROM repo_state WHERE key=?`, key)
 	var val string
 	if err := row.Scan(&val); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return 1, nil
+			return "", false, nil
 		}
-		return 0, err
+		return "", false, err
 	}
-	var gen int64
-	if _, err := fmt.Sscanf(val, "%d", &gen); err != nil {
-		return 0, err
+	return val, true, nil
+}
+
+func stateInt64(ctx context.Context, q stateQueryer, key string) (int64, bool, error) {
+	val, ok, err := stateValue(ctx, q, key)
+	if err != nil || !ok {
+		return 0, ok, err
 	}
-	return gen + 1, nil
+	var parsed int64
+	if _, err := fmt.Sscanf(val, "%d", &parsed); err != nil {
+		return 0, true, err
+	}
+	return parsed, true, nil
 }
 
 func upsertState(ctx context.Context, tx *sql.Tx, key string, value string) error {

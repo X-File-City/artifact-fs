@@ -21,16 +21,17 @@ import (
 )
 
 type Store struct {
-	logger *slog.Logger
-	mu     sync.Mutex
-	pools  map[string]*batchPool // gitDir -> pool
+	logger      *slog.Logger
+	mu          sync.Mutex
+	poolMaxSize int
+	pools       map[string]*batchPool // gitDir -> pool
 }
 
 func New(logger *slog.Logger) *Store {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Store{logger: logger, pools: map[string]*batchPool{}}
+	return &Store{logger: logger, poolMaxSize: 4, pools: map[string]*batchPool{}}
 }
 
 // Close shuts down all persistent batch processes.
@@ -40,6 +41,18 @@ func (s *Store) Close() {
 	for dir, p := range s.pools {
 		p.closeAll()
 		delete(s.pools, dir)
+	}
+}
+
+func (s *Store) SetBatchPoolSize(n int) {
+	if n <= 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.poolMaxSize = n
+	for _, p := range s.pools {
+		p.setMaxSize(n)
 	}
 }
 
@@ -238,13 +251,21 @@ func (s *Store) BlobToCache(ctx context.Context, repo model.RepoConfig, objectOI
 	return size, err
 }
 
+func (s *Store) VerifyBlob(ctx context.Context, repo model.RepoConfig, objectOID string, cachePath string) (bool, error) {
+	out, err := runGit(ctx, repo.GitDir, "hash-object", "--no-filters", cachePath)
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(out) == objectOID, nil
+}
+
 func (s *Store) getPool(gitDir string) *batchPool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if p, ok := s.pools[gitDir]; ok {
 		return p
 	}
-	p := &batchPool{gitDir: gitDir, logger: s.logger, maxSize: 4}
+	p := &batchPool{gitDir: gitDir, logger: s.logger, maxSize: s.poolMaxSize}
 	s.pools[gitDir] = p
 	return p
 }
@@ -297,6 +318,20 @@ func (p *batchPool) closeAll() {
 		b.close()
 	}
 	p.free = nil
+}
+
+func (p *batchPool) setMaxSize(n int) {
+	var extras []*batchCatFile
+	p.mu.Lock()
+	p.maxSize = n
+	if len(p.free) > n {
+		extras = append(extras, p.free[n:]...)
+		p.free = p.free[:n]
+	}
+	p.mu.Unlock()
+	for _, b := range extras {
+		b.close()
+	}
 }
 
 // batchCatFile manages a persistent `git cat-file --batch` process. The
@@ -381,7 +416,8 @@ func (b *batchCatFile) fetchToFile(oid string, dstPath string) (int64, error) {
 		return 0, fmt.Errorf("parse size %q: %w", fields[2], err)
 	}
 
-	// Stream blob content to a temp file, then atomic rename.
+	// Stream blob content to a temp file, then atomic rename. The blob cache is
+	// reconstructible from git, so we prefer throughput over per-object fsync.
 	tmp := dstPath + ".tmp"
 	f, err := os.Create(tmp)
 	if err != nil {
@@ -396,11 +432,7 @@ func (b *batchCatFile) fetchToFile(oid string, dstPath string) (int64, error) {
 	if _, lfErr := b.stdout.ReadByte(); lfErr != nil && copyErr == nil {
 		copyErr = fmt.Errorf("batch read trailing LF: %w", lfErr)
 	}
-
-	if syncErr := f.Sync(); syncErr != nil && copyErr == nil {
-		copyErr = syncErr
-	}
-	f.Close()
+	closeErr := f.Close()
 
 	if copyErr != nil || written != size {
 		os.Remove(tmp)
@@ -408,6 +440,10 @@ func (b *batchCatFile) fetchToFile(oid string, dstPath string) (int64, error) {
 			return 0, fmt.Errorf("batch read content: %w", copyErr)
 		}
 		return 0, fmt.Errorf("short read: got %d, want %d", written, size)
+	}
+	if closeErr != nil {
+		os.Remove(tmp)
+		return 0, fmt.Errorf("close temp blob file: %w", closeErr)
 	}
 
 	if err := os.Rename(tmp, dstPath); err != nil {

@@ -221,6 +221,24 @@ func TestCredentialEnvTokenAsUsername(t *testing.T) {
 	}
 }
 
+func TestSetBatchPoolSizeUpdatesExistingAndNewPools(t *testing.T) {
+	t.Parallel()
+	store := New(nil)
+	first := store.getPool("/tmp/repo-a.git")
+	if first.maxSize != 4 {
+		t.Fatalf("initial pool maxSize = %d, want 4", first.maxSize)
+	}
+
+	store.SetBatchPoolSize(12)
+	if first.maxSize != 12 {
+		t.Fatalf("updated existing pool maxSize = %d, want 12", first.maxSize)
+	}
+	second := store.getPool("/tmp/repo-b.git")
+	if second.maxSize != 12 {
+		t.Fatalf("new pool maxSize = %d, want 12", second.maxSize)
+	}
+}
+
 func run(t *testing.T, name string, args ...string) {
 	t.Helper()
 	cmd := exec.Command(name, args...)

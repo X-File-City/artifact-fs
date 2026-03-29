@@ -31,7 +31,7 @@ func (e *Engine) ensureOverlay(ctx context.Context, path string) error {
 		return err
 	}
 	if n.Base.ObjectOID != "" {
-		if _, _, hErr := e.Hydrator.EnsureHydrated(ctx, e.Repo, path, n.Base.ObjectOID); hErr != nil {
+		if _, _, hErr := e.Hydrator.EnsureHydrated(ctx, e.Repo, n.Base); hErr != nil {
 			return hErr
 		}
 	}
@@ -50,7 +50,7 @@ func (e *Engine) Read(ctx context.Context, path string, off int64, size int) ([]
 	if err != nil {
 		return nil, err
 	}
-	cachePath, _, err := e.Hydrator.EnsureHydrated(ctx, e.Repo, path, n.Base.ObjectOID)
+	cachePath, _, err := e.Hydrator.EnsureHydrated(ctx, e.Repo, n.Base)
 	if err != nil {
 		return nil, err
 	}
