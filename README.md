@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="artifacts.png" alt="Artifacts" width="720">
+</p>
+
 # ArtifactFS
 
 > This is a beta release of ArtifactFS. Your mileage may vary.

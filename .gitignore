@@ -1,5 +1,5 @@
 # Build output
-artifact-fs
+/artifact-fs
 *.exe
 *.test
 *.out
