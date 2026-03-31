@@ -4,6 +4,8 @@
 
 # ArtifactFS
 
+[![Build & Test](https://github.com/cloudflare/artifact-fs/actions/workflows/build-test.yml/badge.svg)](https://github.com/cloudflare/artifact-fs/actions/workflows/build-test.yml)
+
 > This is a beta release of ArtifactFS. Your mileage may vary.
 
 ArtifactFS is a Git-backed filesystem daemon (FUSE driver) in Go that mounts repositories as normal working trees while avoiding eager blob downloads.
