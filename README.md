@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="artifacts.png" alt="Artifacts" width="720">
+  <img src="artifact-fs.png" alt="ArtifactFS" width="720">
 </p>
 
 # ArtifactFS
