@@ -244,7 +244,7 @@
       "colorMode": "fileTypes",
       "highlightLayers": [
         {
-          "id": "entry-cli-final",
+          "id": "entry-cli",
           "name": "Entry & CLI",
           "color": "#3b82f6",
           "items": [
@@ -255,7 +255,7 @@
           "renderStrategy": "border"
         },
         {
-          "id": "orchestration-final",
+          "id": "orchestration",
           "name": "Orchestration",
           "color": "#10b981",
           "items": [
@@ -266,7 +266,7 @@
           "renderStrategy": "border"
         },
         {
-          "id": "fuse-overlay-final",
+          "id": "fuse-overlay",
           "name": "FUSE Filesystem",
           "color": "#f59e0b",
           "items": [
@@ -277,7 +277,7 @@
           "renderStrategy": "border"
         },
         {
-          "id": "git-hydration-final",
+          "id": "git-hydration",
           "name": "Git & Hydration",
           "color": "#ef4444",
           "items": [
@@ -289,7 +289,7 @@
           "renderStrategy": "border"
         },
         {
-          "id": "support-final",
+          "id": "support",
           "name": "Supporting Utilities",
           "color": "#a855f7",
           "items": [
