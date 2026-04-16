@@ -1,0 +1,319 @@
+{
+  "id": "artifact-fs-onboarding",
+  "title": "ArtifactFS Onboarding Tour",
+  "description": "A guided walkthrough of ArtifactFS — a Git-backed FUSE filesystem daemon in Go that mounts repositories as working trees and hydrates file contents on demand.",
+  "version": "1.0.0",
+  "audience": "New Contributors",
+  "prerequisites": [
+    "Familiarity with Go",
+    "Basic understanding of FUSE and Git internals"
+  ],
+  "steps": [
+    {
+      "id": "step-1-overview",
+      "title": "Project Overview",
+      "description": "Welcome to ArtifactFS. It's a Go module that ships a single command-line tool which registers repositories, runs a FUSE daemon, and hydrates blobs lazily. Start here with a view of the whole project — the five subsystems that cooperate to present a git repo as a live filesystem are grouped by color.",
+      "estimatedTime": 60,
+      "focusDirectory": "",
+      "colorMode": "fileTypes",
+      "highlightLayers": [
+        {
+          "id": "entry-cli",
+          "name": "Entry & CLI",
+          "color": "#3b82f6",
+          "items": [
+            { "path": "cmd/artifact-fs", "type": "directory" },
+            { "path": "internal/cli", "type": "directory" }
+          ],
+          "opacity": 0.7,
+          "renderStrategy": "border"
+        },
+        {
+          "id": "orchestration",
+          "name": "Orchestration",
+          "color": "#10b981",
+          "items": [
+            { "path": "internal/daemon", "type": "directory" },
+            { "path": "internal/registry", "type": "directory" }
+          ],
+          "opacity": 0.7,
+          "renderStrategy": "border"
+        },
+        {
+          "id": "fuse-overlay",
+          "name": "FUSE Filesystem",
+          "color": "#f59e0b",
+          "items": [
+            { "path": "internal/fusefs", "type": "directory" },
+            { "path": "internal/overlay", "type": "directory" }
+          ],
+          "opacity": 0.7,
+          "renderStrategy": "border"
+        },
+        {
+          "id": "git-hydration",
+          "name": "Git & Hydration",
+          "color": "#ef4444",
+          "items": [
+            { "path": "internal/gitstore", "type": "directory" },
+            { "path": "internal/hydrator", "type": "directory" },
+            { "path": "internal/snapshot", "type": "directory" }
+          ],
+          "opacity": 0.7,
+          "renderStrategy": "border"
+        },
+        {
+          "id": "support",
+          "name": "Supporting Utilities",
+          "color": "#a855f7",
+          "items": [
+            { "path": "internal/model", "type": "directory" },
+            { "path": "internal/watcher", "type": "directory" },
+            { "path": "internal/auth", "type": "directory" },
+            { "path": "internal/logging", "type": "directory" },
+            { "path": "internal/meta", "type": "directory" }
+          ],
+          "opacity": 0.7,
+          "renderStrategy": "border"
+        }
+      ]
+    },
+    {
+      "id": "step-2-entry-point",
+      "title": "CLI Entry Point",
+      "description": "The binary is built from a tiny entry point that immediately delegates into the CLI package. The CLI parses the user-facing subcommands for adding a repository, starting the daemon, checking status, and removing a repository, and wires each one into the daemon and registry.",
+      "estimatedTime": 60,
+      "focusDirectory": "",
+      "colorMode": "fileTypes",
+      "highlightLayers": [
+        {
+          "id": "entry-layer",
+          "name": "Entry Point & CLI",
+          "color": "#3b82f6",
+          "items": [
+            { "path": "cmd/artifact-fs/main.go", "type": "file" },
+            { "path": "internal/cli/cli.go", "type": "file" }
+          ],
+          "opacity": 0.8,
+          "renderStrategy": "border"
+        }
+      ]
+    },
+    {
+      "id": "step-3-orchestration",
+      "title": "Daemon & Registry",
+      "description": "The orchestration layer owns the long-running daemon lifecycle and the registry of mounted repositories. The daemon coordinates mount, refresh, and shutdown. The registry is the SQLite-backed source of truth for which repos are known and where they're configured to mount.",
+      "estimatedTime": 90,
+      "focusDirectory": "internal",
+      "colorMode": "fileTypes",
+      "highlightLayers": [
+        {
+          "id": "orchestration-layer",
+          "name": "Orchestration",
+          "color": "#10b981",
+          "items": [
+            { "path": "internal/daemon/daemon.go", "type": "file" },
+            { "path": "internal/registry/registry.go", "type": "file" }
+          ],
+          "opacity": 0.75,
+          "renderStrategy": "border"
+        }
+      ]
+    },
+    {
+      "id": "step-4-fuse",
+      "title": "FUSE Filesystem Layer",
+      "description": "The FUSE layer is where the operating system meets the repository. One file dispatches kernel callbacks, another composes the snapshot of the git tree with the overlay of local writes into a single read-through view, and platform-specific mount logic is split cleanly between macOS and Linux.",
+      "estimatedTime": 120,
+      "focusDirectory": "internal/fusefs",
+      "colorMode": "fileTypes",
+      "highlightLayers": [
+        {
+          "id": "fuse-core",
+          "name": "FUSE Core",
+          "color": "#f59e0b",
+          "items": [
+            { "path": "internal/fusefs/ops.go", "type": "file" },
+            { "path": "internal/fusefs/merged.go", "type": "file" },
+            { "path": "internal/fusefs/fuse_darwin.go", "type": "file" },
+            { "path": "internal/fusefs/fuse_linux.go", "type": "file" }
+          ],
+          "opacity": 0.8,
+          "renderStrategy": "border"
+        }
+      ]
+    },
+    {
+      "id": "step-5-hydration",
+      "title": "Lazy Blob Hydration",
+      "description": "The hydrator manages background blob fetching. A worker pool keeps long-lived git batch processes ready to stream blobs on demand, with concurrency tunable at the command line. A separate in-flight tracker deduplicates concurrent requests so each blob is fetched exactly once even under heavy parallel reads.",
+      "estimatedTime": 90,
+      "focusDirectory": "internal/hydrator",
+      "colorMode": "fileTypes",
+      "highlightLayers": [
+        {
+          "id": "hydration-files",
+          "name": "Hydration Pipeline",
+          "color": "#ef4444",
+          "items": [
+            { "path": "internal/hydrator/hydrator.go", "type": "file" },
+            { "path": "internal/hydrator/inflight.go", "type": "file" }
+          ],
+          "opacity": 0.8,
+          "renderStrategy": "border"
+        }
+      ]
+    },
+    {
+      "id": "step-6-persistence",
+      "title": "State & Persistence",
+      "description": "Four packages hold state. The git store wraps the bare repository. The snapshot store preserves consistent tree views keyed by generation. The overlay captures local writes so the mount behaves like a mutable working tree on top of the read-only git view. A shared SQLite helper underpins the metadata.",
+      "estimatedTime": 120,
+      "focusDirectory": "internal",
+      "colorMode": "fileTypes",
+      "highlightLayers": [
+        {
+          "id": "persistence-layer",
+          "name": "State Stores",
+          "color": "#06b6d4",
+          "items": [
+            { "path": "internal/gitstore/gitstore.go", "type": "file" },
+            { "path": "internal/snapshot/store.go", "type": "file" },
+            { "path": "internal/overlay/store.go", "type": "file" },
+            { "path": "internal/meta/sqlite.go", "type": "file" }
+          ],
+          "opacity": 0.75,
+          "renderStrategy": "border"
+        }
+      ]
+    },
+    {
+      "id": "step-7-tests",
+      "title": "End-to-End Tests & Benchmarks",
+      "description": "The root-level end-to-end tests exercise the full daemon against real FUSE mounts, with platform-specific setup kept in separate files so each platform's quirks stay isolated. The benchmark suites capture performance baselines — essential reading before tuning hydration or the filesystem layer.",
+      "estimatedTime": 90,
+      "focusDirectory": "",
+      "colorMode": "fileTypes",
+      "highlightLayers": [
+        {
+          "id": "test-layer",
+          "name": "E2E & Benchmark Tests",
+          "color": "#eab308",
+          "items": [
+            { "path": "e2e_test.go", "type": "file" },
+            { "path": "e2e_git_test.go", "type": "file" },
+            { "path": "e2e_bench_test.go", "type": "file" },
+            { "path": "e2e_setup_darwin_test.go", "type": "file" },
+            { "path": "e2e_setup_linux_test.go", "type": "file" },
+            { "path": "bench_test.go", "type": "file" }
+          ],
+          "opacity": 0.75,
+          "renderStrategy": "border"
+        }
+      ]
+    },
+    {
+      "id": "step-8-support",
+      "title": "Supporting Packages",
+      "description": "The smaller packages round out the system. Shared data structures and canonical interfaces live in the model package. A watcher polls the gitdir to react to HEAD changes. An auth helper scrubs credentials out of log lines before they're emitted. And the logging package provides the structured JSON logger used across the daemon.",
+      "estimatedTime": 90,
+      "focusDirectory": "internal",
+      "colorMode": "fileTypes",
+      "highlightLayers": [
+        {
+          "id": "support-layer",
+          "name": "Supporting Utilities",
+          "color": "#a855f7",
+          "items": [
+            { "path": "internal/model/types.go", "type": "file" },
+            { "path": "internal/watcher/watcher.go", "type": "file" },
+            { "path": "internal/auth/redact.go", "type": "file" },
+            { "path": "internal/logging/logging.go", "type": "file" }
+          ],
+          "opacity": 0.7,
+          "renderStrategy": "border"
+        }
+      ]
+    },
+    {
+      "id": "step-9-next-steps",
+      "title": "Next Steps",
+      "description": "You've seen the layout. Read the project readme for usage and the contributor guide for build commands and conventions. Try the quick-start flow — register a repository, then start the daemon — against any public repo. Finally, explore the examples directory for containerized deployments, including the Cloudflare sandbox SDK integration.",
+      "estimatedTime": 60,
+      "focusDirectory": "",
+      "colorMode": "fileTypes",
+      "highlightLayers": [
+        {
+          "id": "entry-cli-final",
+          "name": "Entry & CLI",
+          "color": "#3b82f6",
+          "items": [
+            { "path": "cmd/artifact-fs", "type": "directory" },
+            { "path": "internal/cli", "type": "directory" }
+          ],
+          "opacity": 0.7,
+          "renderStrategy": "border"
+        },
+        {
+          "id": "orchestration-final",
+          "name": "Orchestration",
+          "color": "#10b981",
+          "items": [
+            { "path": "internal/daemon", "type": "directory" },
+            { "path": "internal/registry", "type": "directory" }
+          ],
+          "opacity": 0.7,
+          "renderStrategy": "border"
+        },
+        {
+          "id": "fuse-overlay-final",
+          "name": "FUSE Filesystem",
+          "color": "#f59e0b",
+          "items": [
+            { "path": "internal/fusefs", "type": "directory" },
+            { "path": "internal/overlay", "type": "directory" }
+          ],
+          "opacity": 0.7,
+          "renderStrategy": "border"
+        },
+        {
+          "id": "git-hydration-final",
+          "name": "Git & Hydration",
+          "color": "#ef4444",
+          "items": [
+            { "path": "internal/gitstore", "type": "directory" },
+            { "path": "internal/hydrator", "type": "directory" },
+            { "path": "internal/snapshot", "type": "directory" }
+          ],
+          "opacity": 0.7,
+          "renderStrategy": "border"
+        },
+        {
+          "id": "support-final",
+          "name": "Supporting Utilities",
+          "color": "#a855f7",
+          "items": [
+            { "path": "internal/model", "type": "directory" },
+            { "path": "internal/watcher", "type": "directory" },
+            { "path": "internal/auth", "type": "directory" },
+            { "path": "internal/logging", "type": "directory" },
+            { "path": "internal/meta", "type": "directory" }
+          ],
+          "opacity": 0.7,
+          "renderStrategy": "border"
+        }
+      ]
+    }
+  ],
+  "metadata": {
+    "author": "Claude Code",
+    "createdAt": "2026-04-16",
+    "tags": [
+      "onboarding",
+      "go",
+      "fuse",
+      "git",
+      "cloudflare"
+    ]
+  }
+}
