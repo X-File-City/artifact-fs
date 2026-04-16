@@ -12,71 +12,10 @@
     {
       "id": "step-1-overview",
       "title": "Project Overview",
-      "description": "Welcome to ArtifactFS. It's a Go module that ships a single command-line tool which registers repositories, runs a FUSE daemon, and hydrates blobs lazily. Start here with a view of the whole project — the five subsystems that cooperate to present a git repo as a live filesystem are grouped by color.",
+      "description": "Welcome to ArtifactFS. It's a Go module that ships a single command-line tool which registers repositories, runs a FUSE daemon, and hydrates blobs lazily. Start here with a view of the whole project — a fast blobless clone, a long-running daemon, and the FUSE layer that makes it all feel like a normal working tree.",
       "estimatedTime": 60,
       "focusDirectory": "",
-      "colorMode": "fileTypes",
-      "highlightLayers": [
-        {
-          "id": "entry-cli",
-          "name": "Entry & CLI",
-          "color": "#3b82f6",
-          "items": [
-            { "path": "cmd/artifact-fs", "type": "directory" },
-            { "path": "internal/cli", "type": "directory" }
-          ],
-          "opacity": 0.7,
-          "renderStrategy": "border"
-        },
-        {
-          "id": "orchestration",
-          "name": "Orchestration",
-          "color": "#10b981",
-          "items": [
-            { "path": "internal/daemon", "type": "directory" },
-            { "path": "internal/registry", "type": "directory" }
-          ],
-          "opacity": 0.7,
-          "renderStrategy": "border"
-        },
-        {
-          "id": "fuse-overlay",
-          "name": "FUSE Filesystem",
-          "color": "#f59e0b",
-          "items": [
-            { "path": "internal/fusefs", "type": "directory" },
-            { "path": "internal/overlay", "type": "directory" }
-          ],
-          "opacity": 0.7,
-          "renderStrategy": "border"
-        },
-        {
-          "id": "git-hydration",
-          "name": "Git & Hydration",
-          "color": "#ef4444",
-          "items": [
-            { "path": "internal/gitstore", "type": "directory" },
-            { "path": "internal/hydrator", "type": "directory" },
-            { "path": "internal/snapshot", "type": "directory" }
-          ],
-          "opacity": 0.7,
-          "renderStrategy": "border"
-        },
-        {
-          "id": "support",
-          "name": "Supporting Utilities",
-          "color": "#a855f7",
-          "items": [
-            { "path": "internal/model", "type": "directory" },
-            { "path": "internal/watcher", "type": "directory" },
-            { "path": "internal/auth", "type": "directory" },
-            { "path": "internal/logging", "type": "directory" },
-            { "path": "internal/meta", "type": "directory" }
-          ],
-          "opacity": 0.7,
-          "renderStrategy": "border"
-        }
-      ]
+      "colorMode": "fileTypes"
     },
     {
       "id": "step-2-entry-point",
@@ -241,68 +180,7 @@
       "description": "You've seen the layout. Read the project readme for usage and the contributor guide for build commands and conventions. Try the quick-start flow — register a repository, then start the daemon — against any public repo. Finally, explore the examples directory for containerized deployments, including the Cloudflare sandbox SDK integration.",
       "estimatedTime": 60,
       "focusDirectory": "",
-      "colorMode": "fileTypes",
-      "highlightLayers": [
-        {
-          "id": "entry-cli-recap",
-          "name": "Entry & CLI",
-          "color": "#3b82f6",
-          "items": [
-            { "path": "cmd/artifact-fs", "type": "directory" },
-            { "path": "internal/cli", "type": "directory" }
-          ],
-          "opacity": 0.7,
-          "renderStrategy": "border"
-        },
-        {
-          "id": "orchestration-recap",
-          "name": "Orchestration",
-          "color": "#10b981",
-          "items": [
-            { "path": "internal/daemon", "type": "directory" },
-            { "path": "internal/registry", "type": "directory" }
-          ],
-          "opacity": 0.7,
-          "renderStrategy": "border"
-        },
-        {
-          "id": "fuse-overlay-recap",
-          "name": "FUSE Filesystem",
-          "color": "#f59e0b",
-          "items": [
-            { "path": "internal/fusefs", "type": "directory" },
-            { "path": "internal/overlay", "type": "directory" }
-          ],
-          "opacity": 0.7,
-          "renderStrategy": "border"
-        },
-        {
-          "id": "git-hydration-recap",
-          "name": "Git & Hydration",
-          "color": "#ef4444",
-          "items": [
-            { "path": "internal/gitstore", "type": "directory" },
-            { "path": "internal/hydrator", "type": "directory" },
-            { "path": "internal/snapshot", "type": "directory" }
-          ],
-          "opacity": 0.7,
-          "renderStrategy": "border"
-        },
-        {
-          "id": "support-recap",
-          "name": "Supporting Utilities",
-          "color": "#a855f7",
-          "items": [
-            { "path": "internal/model", "type": "directory" },
-            { "path": "internal/watcher", "type": "directory" },
-            { "path": "internal/auth", "type": "directory" },
-            { "path": "internal/logging", "type": "directory" },
-            { "path": "internal/meta", "type": "directory" }
-          ],
-          "opacity": 0.7,
-          "renderStrategy": "border"
-        }
-      ]
+      "colorMode": "fileTypes"
     }
   ],
   "metadata": {
